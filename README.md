@@ -41,11 +41,14 @@ Current module layout:
 
 ```text
 src/win7ui/
+  controls.rs
   dialogs.rs
   hotkey.rs
+  layout.rs
   log_view.rs
-  controls.rs
+  overlay.rs
   text.rs
+  window.rs
   mod.rs
 ```
 
@@ -53,10 +56,10 @@ The current Win7 application still owns the higher-level automation workflow. Fu
 
 ```text
 src/win7ui/
-  capture_overlay.rs
-  layout.rs
   app.rs
   event.rs
+  menu.rs
+  status_bar.rs
 ```
 
 ## Build

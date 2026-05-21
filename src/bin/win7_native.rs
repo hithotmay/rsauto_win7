@@ -23,12 +23,8 @@ use image::{imageops, RgbaImage};
 use pyauto_rs::win7ui;
 use screenshots::Screen;
 use windows_sys::Win32::{
-    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
-    Graphics::Gdi::{
-        BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetStockObject, HBRUSH,
-        InvalidateRect, Rectangle, SelectObject, UpdateWindow, BLACK_BRUSH, COLOR_WINDOW,
-        HOLLOW_BRUSH, PAINTSTRUCT, PS_SOLID,
-    },
+    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+    Graphics::Gdi::{UpdateWindow, COLOR_WINDOW},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE},
@@ -167,27 +163,14 @@ fn hwnd_value(value: HWND) -> isize {
 
 fn main() {
     unsafe {
-        let hinstance = GetModuleHandleW(null_mut());
-        register_class("PyAutoRsWin7Native", Some(wnd_proc), (COLOR_WINDOW + 1) as _);
-        register_class("PyAutoRsCaptureOverlay", Some(overlay_proc), null_mut());
-        register_class("PyAutoRsCaptureConfirm", Some(confirm_proc), (COLOR_WINDOW + 1) as _);
+        win7ui::register_class("PyAutoRsWin7Native", Some(wnd_proc), (COLOR_WINDOW + 1) as _);
+        win7ui::register_class("PyAutoRsCaptureOverlay", Some(overlay_proc), null_mut());
+        win7ui::register_class("PyAutoRsCaptureConfirm", Some(confirm_proc), (COLOR_WINDOW + 1) as _);
 
         APP.set(Mutex::new(AppState::default())).ok();
 
-        let hwnd = CreateWindowExW(
-            0,
-            wide("PyAutoRsWin7Native").as_ptr(),
-            wide("PyAuto Rust Win7 Native").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1120,
-            780,
-            null_mut(),
-            null_mut(),
-            hinstance,
-            null_mut(),
-        );
+        let hwnd =
+            win7ui::create_main_window("PyAutoRsWin7Native", "PyAuto Rust Win7 Native", 1120, 780);
 
         if hwnd.is_null() {
             return;
@@ -200,26 +183,8 @@ fn main() {
             append_log("F11 全局停止热键注册失败，可能被其他程序占用。");
         }
 
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        win7ui::message_loop();
     }
-}
-
-unsafe fn register_class(name: &str, proc: WNDPROC, background: HBRUSH) {
-    let hinstance = GetModuleHandleW(null_mut());
-    let class_name = wide(name);
-    let wc = WNDCLASSW {
-        lpfnWndProc: proc,
-        hInstance: hinstance,
-        lpszClassName: class_name.as_ptr(),
-        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: background,
-        ..std::mem::zeroed()
-    };
-    RegisterClassW(&wc);
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -361,29 +326,28 @@ unsafe fn layout_controls(hwnd: HWND) {
 
     if let Some(app) = APP.get() {
         let app = app.lock().unwrap();
-        let mut x = 10;
-        for (button, w) in [
-            (app.open_button, 76),
-            (app.save_button, 76),
-            (app.save_as_button, 86),
-            (app.run_button, 92),
-            (app.stop_button, 96),
-            (app.capture_button, 98),
-            (app.click_image_button, 98),
-            (app.capture_point_button, 98),
-        ] {
-            MoveWindow(to_hwnd(button), x, 10, w, 28, 1);
-            x += w + 8;
-        }
+        win7ui::row_layout(
+            &[
+                (to_hwnd(app.open_button), 76),
+                (to_hwnd(app.save_button), 76),
+                (to_hwnd(app.save_as_button), 86),
+                (to_hwnd(app.run_button), 92),
+                (to_hwnd(app.stop_button), 96),
+                (to_hwnd(app.capture_button), 98),
+                (to_hwnd(app.click_image_button), 98),
+                (to_hwnd(app.capture_point_button), 98),
+            ],
+            10,
+            10,
+            28,
+            8,
+        );
 
-        MoveWindow(to_hwnd(app.status), 10, 44, width - 20, 22, 1);
+        win7ui::move_window(to_hwnd(app.status), 10, 44, width - 20, 22);
 
-        let log_w = 410;
-        let gap = 10;
-        let editor_w = (width - log_w - gap * 3).max(250);
-        let body_h = (height - 80).max(160);
-        MoveWindow(to_hwnd(app.script), 10, 70, editor_w, body_h, 1);
-        MoveWindow(to_hwnd(app.log), 20 + editor_w, 70, log_w, body_h, 1);
+        let split = win7ui::split_left_right(width, height, 10, 70, 10, 410, 250);
+        win7ui::move_window(to_hwnd(app.script), split.left_x, split.y, split.left_w, split.h);
+        win7ui::move_window(to_hwnd(app.log), split.right_x, split.y, split.right_w, split.h);
     }
 }
 
@@ -631,7 +595,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             0
         }
         WM_LBUTTONDOWN => {
-            let pos = lparam_pos(lparam);
+            let pos = win7ui::lparam_pos(lparam);
             if capture_point_click(hwnd, pos) {
                 return 0;
             }
@@ -644,15 +608,15 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 }
             }
             SetCapture(hwnd);
-            InvalidateRect(hwnd, null_mut(), 1);
+            win7ui::overlay::invalidate(hwnd);
             0
         }
         WM_MOUSEMOVE => {
             if let Some(app) = APP.get() {
                 if let Some(capture) = &mut app.lock().unwrap().capture {
                     if capture.dragging {
-                        capture.end = Some(lparam_pos(lparam));
-                        InvalidateRect(hwnd, null_mut(), 1);
+                        capture.end = Some(win7ui::lparam_pos(lparam));
+                        win7ui::overlay::invalidate(hwnd);
                     }
                 }
             }
@@ -664,7 +628,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             if let Some(app) = APP.get() {
                 if let Some(capture) = &mut app.lock().unwrap().capture {
                     capture.dragging = false;
-                    capture.end = Some(lparam_pos(lparam));
+                    capture.end = Some(win7ui::lparam_pos(lparam));
                     capture.selection = capture_rect(capture);
                     confirmed = capture.selection.is_some();
                     if confirmed {
@@ -677,7 +641,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 show_confirm_window();
             } else {
                 append_log("框选区域太小，请重新拖动选择。");
-                InvalidateRect(hwnd, null_mut(), 1);
+                win7ui::overlay::invalidate(hwnd);
             }
             0
         }
@@ -690,31 +654,10 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
 }
 
 unsafe fn paint_overlay(hwnd: HWND) {
-    let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    GetClientRect(hwnd, &mut rect);
-    FillRect(hdc, &rect, GetStockObject(BLACK_BRUSH) as _);
-
-    if let Some(app) = APP.get() {
-        if let Some(capture) = &app.lock().unwrap().capture {
-            if let Some((left, top, right, bottom)) = current_rect(capture) {
-                let pen = CreatePen(PS_SOLID, 3, rgb(255, 64, 128));
-                let old_pen = SelectObject(hdc, pen as _);
-                let old_brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-                Rectangle(hdc, left, top, right, bottom);
-                SelectObject(hdc, old_brush);
-                SelectObject(hdc, old_pen);
-                DeleteObject(pen as _);
-            }
-        }
-    }
-    EndPaint(hwnd, &ps);
+    let selection = APP
+        .get()
+        .and_then(|app| app.lock().unwrap().capture.as_ref().and_then(current_rect));
+    win7ui::paint_selection_overlay(hwnd, selection);
 }
 
 unsafe fn capture_point_click(hwnd: HWND, pos: (i32, i32)) -> bool {
@@ -745,27 +688,17 @@ unsafe fn capture_point_click(hwnd: HWND, pos: (i32, i32)) -> bool {
     true
 }
 
-fn current_rect(capture: &CaptureState) -> Option<(i32, i32, i32, i32)> {
-    let (x1, y1) = capture.start?;
-    let (x2, y2) = capture.end?;
-    let left = x1.min(x2).clamp(0, capture.width);
-    let top = y1.min(y2).clamp(0, capture.height);
-    let right = x1.max(x2).clamp(0, capture.width);
-    let bottom = y1.max(y2).clamp(0, capture.height);
-    if right - left >= 3 && bottom - top >= 3 {
-        Some((left, top, right, bottom))
-    } else {
-        None
-    }
+fn current_rect(capture: &CaptureState) -> Option<win7ui::SelectionRect> {
+    win7ui::client_selection_rect(capture.start, capture.end, capture.width, capture.height, 3)
 }
 
 fn capture_rect(capture: &CaptureState) -> Option<ImageRect> {
-    let (left, top, right, bottom) = current_rect(capture)?;
+    let rect = current_rect(capture)?;
     Some(ImageRect {
-        left: left as u32,
-        top: top as u32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
+        left: rect.left as u32,
+        top: rect.top as u32,
+        width: rect.width() as u32,
+        height: rect.height() as u32,
     })
 }
 
@@ -1078,7 +1011,7 @@ unsafe fn reselect_capture() {
         SetCapture(overlay);
         ShowWindow(overlay, SW_SHOW);
         UpdateWindow(overlay);
-        InvalidateRect(overlay, null_mut(), 1);
+        win7ui::overlay::invalidate(overlay);
         set_status("拖动鼠标框选区域，Esc 取消。");
     }
 }
@@ -1233,17 +1166,6 @@ fn timestamp_for_file() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
-}
-
-fn lparam_pos(lparam: LPARAM) -> (i32, i32) {
-    let value = lparam as u32;
-    let x = (value & 0xffff) as i16 as i32;
-    let y = ((value >> 16) & 0xffff) as i16 as i32;
-    (x, y)
-}
-
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
 fn wide(text: &str) -> Vec<u16> {

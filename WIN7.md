@@ -48,12 +48,15 @@ Current scope:
 - edit/log helpers
 - native file dialogs
 - global hotkeys
+- simple row/split layout helpers
+- window class registration and message loop helpers
+- capture overlay geometry and painting helpers
 
 Planned scope:
 
-- capture overlay abstraction
-- log view with latest-line retention
-- simple layouts: absolute, row, split, anchor
+- higher-level capture overlay abstraction
+- more controls: checkbox, combo box, list box, progress bar, tabs, menu
+- layouts: absolute, row, split, anchor, dock
 - optional `.win7ui.toml` UI description files
 - eventual visual designer
 
