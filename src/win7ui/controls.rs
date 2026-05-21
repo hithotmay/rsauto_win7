@@ -6,7 +6,8 @@ use windows_sys::Win32::{
     UI::{
         Input::KeyboardAndMouse::EnableWindow,
         WindowsAndMessaging::{
-            CreateWindowExW, BS_PUSHBUTTON, ES_AUTOHSCROLL, WS_CHILD, WS_VISIBLE,
+            CreateWindowExW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
+            ES_READONLY, ES_WANTRETURN, WS_CHILD, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
             WS_EX_CLIENTEDGE,
         },
     },
@@ -33,20 +34,73 @@ pub unsafe fn enable_window(hwnd: HWND, enabled: bool) {
 }
 
 pub unsafe fn create_button(parent: HWND, text: &str, id: i32) -> HWND {
+    create_button_at(parent, text, id, 0, 0, 90, 28)
+}
+
+pub unsafe fn create_button_at(
+    parent: HWND,
+    text: &str,
+    id: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> HWND {
     let class = wide("BUTTON");
     CreateWindowExW(
         0,
         class.as_ptr(),
         wide(text).as_ptr(),
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
-        0,
-        0,
-        90,
-        28,
+        x,
+        y,
+        w,
+        h,
         parent,
         id as _,
         module_handle(),
         null_mut(),
+    )
+}
+
+pub unsafe fn create_multiline_edit(
+    parent: HWND,
+    text: &str,
+    id: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    readonly: bool,
+    hscroll: bool,
+) -> HWND {
+    let class = wide("EDIT");
+    let mut style = WS_CHILD
+        | WS_VISIBLE
+        | WS_VSCROLL
+        | ES_MULTILINE as u32
+        | ES_AUTOVSCROLL as u32
+        | ES_WANTRETURN as u32;
+    if readonly {
+        style |= ES_READONLY as u32;
+    }
+    if hscroll {
+        style |= WS_HSCROLL | ES_AUTOHSCROLL as u32;
+    }
+
+    CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        class.as_ptr(),
+        wide(text).as_ptr(),
+        style,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        id as _,
+        module_handle(),
+        std::ptr::null_mut(),
     )
 }
 

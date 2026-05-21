@@ -11,7 +11,7 @@ use std::{
     ptr::null_mut,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::Receiver,
         Arc, Mutex, OnceLock,
     },
     thread,
@@ -23,7 +23,7 @@ use image::{imageops, RgbaImage};
 use pyauto_rs::win7ui;
 use screenshots::Screen;
 use windows_sys::Win32::{
-    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     Graphics::Gdi::{UpdateWindow, COLOR_WINDOW},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -42,7 +42,6 @@ const IDC_SAVE_AS: i32 = 107;
 const IDC_CAPTURE: i32 = 108;
 const IDC_CLICK_IMAGE: i32 = 109;
 const IDC_CAPTURE_POINT: i32 = 110;
-const IDC_STATUS: i32 = 111;
 
 const IDC_CONFIRM_DIR: i32 = 301;
 const IDC_CONFIRM_FILE: i32 = 302;
@@ -233,10 +232,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 }
 
 unsafe fn create_controls(hwnd: HWND) {
-    let hinstance = GetModuleHandleW(null_mut());
-    let edit = wide("EDIT");
-    let static_class = wide("STATIC");
-
     let open_button = win7ui::create_button(hwnd, "打开", IDC_OPEN);
     let save_button = win7ui::create_button(hwnd, "保存", IDC_SAVE);
     let save_as_button = win7ui::create_button(hwnd, "另存为", IDC_SAVE_AS);
@@ -246,57 +241,19 @@ unsafe fn create_controls(hwnd: HWND) {
     let click_image_button = win7ui::create_button(hwnd, "点击截图", IDC_CLICK_IMAGE);
     let capture_point_button = win7ui::create_button(hwnd, "捕获坐标", IDC_CAPTURE_POINT);
 
-    let status = CreateWindowExW(
-        0,
-        static_class.as_ptr(),
-        wide("就绪").as_ptr(),
-        WS_CHILD | WS_VISIBLE,
-        10,
-        44,
-        400,
-        22,
+    let status = win7ui::create_label(hwnd, "就绪", 10, 44, 400, 22);
+    let script = win7ui::create_multiline_edit(
         hwnd,
-        IDC_STATUS as _,
-        hinstance,
-        null_mut(),
-    );
-
-    let script = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        edit.as_ptr(),
-        wide(SAMPLE_SCRIPT).as_ptr(),
-        WS_CHILD
-            | WS_VISIBLE
-            | WS_VSCROLL
-            | WS_HSCROLL
-            | ES_MULTILINE as u32
-            | ES_AUTOVSCROLL as u32
-            | ES_AUTOHSCROLL as u32
-            | ES_WANTRETURN as u32,
+        SAMPLE_SCRIPT,
+        IDC_SCRIPT,
         10,
         70,
         650,
         620,
-        hwnd,
-        IDC_SCRIPT as _,
-        hinstance,
-        null_mut(),
+        false,
+        true,
     );
-
-    let log = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        edit.as_ptr(),
-        null_mut(),
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_READONLY as u32,
-        670,
-        70,
-        420,
-        620,
-        hwnd,
-        IDC_LOG as _,
-        hinstance,
-        null_mut(),
-    );
+    let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
 
     if let Some(app) = APP.get() {
         let mut app = app.lock().unwrap();
@@ -352,7 +309,7 @@ unsafe fn layout_controls(hwnd: HWND) {
 }
 
 unsafe fn start_script() {
-    let (script, tx, stop_requested, target_hwnd) = {
+    let (script, tx, stop_requested) = {
         let Some(app_lock) = APP.get() else { return; };
         let mut app = app_lock.lock().unwrap();
         if app.running {
@@ -360,12 +317,12 @@ unsafe fn start_script() {
             return;
         }
         let script = win7ui::get_window_text(to_hwnd(app.script));
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = win7ui::event_channel(to_hwnd(app.hwnd), WM_APP);
         let stop_requested = Arc::new(AtomicBool::new(false));
         app.running = true;
         app.stop_requested = Some(stop_requested.clone());
         app.rx = Some(rx);
-        (script, tx, stop_requested, app.hwnd)
+        (script, tx, stop_requested)
     };
 
     clear_log();
@@ -389,11 +346,11 @@ unsafe fn start_script() {
                 tail_logs.push_back(msg);
 
                 if last_flush.elapsed() >= Duration::from_millis(LOG_SNAPSHOT_INTERVAL_MS) {
-                    send_log_snapshot(&tx, target_hwnd, &tail_logs, total_lines);
+                    send_log_snapshot(&tx, &tail_logs, total_lines);
                     last_flush = Instant::now();
                 }
             })?;
-            send_log_snapshot(&tx, target_hwnd, &tail_logs, total_lines);
+            send_log_snapshot(&tx, &tail_logs, total_lines);
             Ok(())
         });
         match result {
@@ -408,7 +365,7 @@ unsafe fn start_script() {
             }
         }
         let _ = tx.send(AppEvent::Done);
-        unsafe { PostMessageW(to_hwnd(target_hwnd), WM_APP, 0, 0); }
+        unsafe { tx.wake(); }
     });
 }
 
@@ -423,8 +380,7 @@ unsafe fn stop_script() {
 }
 
 fn send_log_snapshot(
-    tx: &Sender<AppEvent>,
-    target_hwnd: isize,
+    tx: &win7ui::UiEventSender<AppEvent>,
     tail_logs: &VecDeque<String>,
     total_lines: usize,
 ) {
@@ -435,7 +391,7 @@ fn send_log_snapshot(
         lines: tail_logs.iter().cloned().collect(),
         total_lines,
     });
-    unsafe { PostMessageW(to_hwnd(target_hwnd), WM_APP, 0, 0); }
+    unsafe { tx.wake(); }
 }
 
 unsafe fn open_script() {
@@ -502,7 +458,7 @@ unsafe fn begin_capture(mode: CaptureMode) {
             append_log("脚本运行中，暂不开始截图。");
             return;
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = win7ui::event_channel(to_hwnd(app.hwnd), WM_APP);
         app.rx = Some(rx);
         (tx, app.hwnd)
     };
@@ -517,8 +473,7 @@ unsafe fn begin_capture(mode: CaptureMode) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(350));
         let result = capture_primary_screen().map_err(|err| err.to_string());
-        let _ = tx.send(AppEvent::CaptureReady { mode, result });
-        unsafe { PostMessageW(to_hwnd(target_hwnd), WM_APP, 0, 0); }
+        let _ = unsafe { tx.send_and_wake(AppEvent::CaptureReady { mode, result }) };
     });
 }
 
@@ -763,10 +718,6 @@ unsafe extern "system" fn confirm_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _lp
 }
 
 unsafe fn create_confirm_controls(hwnd: HWND) {
-    let hinstance = GetModuleHandleW(null_mut());
-    let edit = wide("EDIT");
-    let button = wide("BUTTON");
-
     let (mode, file_name, selected_text) = {
         let Some(app) = APP.get() else { return; };
         let app = app.lock().unwrap();
@@ -790,36 +741,12 @@ unsafe fn create_confirm_controls(hwnd: HWND) {
     };
 
     win7ui::create_label(hwnd, "目录", 18, 20, 70, 22);
-    let dir_edit = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        edit.as_ptr(),
-        wide("captures").as_ptr(),
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-        90,
-        18,
-        430,
-        24,
-        hwnd,
-        IDC_CONFIRM_DIR as _,
-        hinstance,
-        null_mut(),
-    );
+    let dir_edit =
+        win7ui::create_single_line_edit(hwnd, "captures", IDC_CONFIRM_DIR, 90, 18, 430, 24);
 
     win7ui::create_label(hwnd, "文件名", 18, 55, 70, 22);
-    let file_edit = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        edit.as_ptr(),
-        wide(&file_name).as_ptr(),
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-        90,
-        53,
-        430,
-        24,
-        hwnd,
-        IDC_CONFIRM_FILE as _,
-        hinstance,
-        null_mut(),
-    );
+    let file_edit =
+        win7ui::create_single_line_edit(hwnd, &file_name, IDC_CONFIRM_FILE, 90, 53, 430, 24);
 
     win7ui::create_label(hwnd, &selected_text, 90, 86, 430, 22);
 
@@ -828,41 +755,17 @@ unsafe fn create_confirm_controls(hwnd: HWND) {
     let mut y = 116;
     if mode == CaptureMode::ClickImage {
         win7ui::create_label(hwnd, "匹配阈值", 18, 92, 70, 22);
-        threshold_edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            edit.as_ptr(),
-            wide("0.92").as_ptr(),
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-            90,
-            90,
-            90,
-            24,
-            hwnd,
-            IDC_CONFIRM_THRESHOLD as _,
-            hinstance,
-            null_mut(),
-        );
+        threshold_edit =
+            win7ui::create_single_line_edit(hwnd, "0.92", IDC_CONFIRM_THRESHOLD, 90, 90, 90, 24);
         win7ui::create_label(hwnd, "超时 ms", 205, 92, 70, 22);
-        timeout_edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            edit.as_ptr(),
-            wide("3000").as_ptr(),
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-            275,
-            90,
-            90,
-            24,
-            hwnd,
-            IDC_CONFIRM_TIMEOUT as _,
-            hinstance,
-            null_mut(),
-        );
+        timeout_edit =
+            win7ui::create_single_line_edit(hwnd, "3000", IDC_CONFIRM_TIMEOUT, 275, 90, 90, 24);
         y = 150;
     }
 
-    create_confirm_button(hwnd, hinstance, &button, "确认", IDC_CONFIRM_OK, 210, y);
-    create_confirm_button(hwnd, hinstance, &button, "重选", IDC_CONFIRM_RESELECT, 310, y);
-    create_confirm_button(hwnd, hinstance, &button, "取消", IDC_CONFIRM_CANCEL, 410, y);
+    win7ui::create_button_at(hwnd, "确认", IDC_CONFIRM_OK, 210, y, 82, 28);
+    win7ui::create_button_at(hwnd, "重选", IDC_CONFIRM_RESELECT, 310, y, 82, 28);
+    win7ui::create_button_at(hwnd, "取消", IDC_CONFIRM_CANCEL, 410, y, 82, 28);
 
     if let Some(app) = APP.get() {
         app.lock().unwrap().confirm = Some(ConfirmState {
@@ -873,23 +776,6 @@ unsafe fn create_confirm_controls(hwnd: HWND) {
             timeout_edit: hwnd_value(timeout_edit),
         });
     }
-}
-
-unsafe fn create_confirm_button(parent: HWND, hinstance: HINSTANCE, class: &[u16], text: &str, id: i32, x: i32, y: i32) {
-    CreateWindowExW(
-        0,
-        class.as_ptr(),
-        wide(text).as_ptr(),
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
-        x,
-        y,
-        82,
-        28,
-        parent,
-        id as _,
-        hinstance,
-        null_mut(),
-    );
 }
 
 unsafe fn confirm_capture() {
@@ -1108,7 +994,7 @@ unsafe fn drain_events() {
             let hwnd = app.lock().unwrap().hwnd;
             app.lock().unwrap().rx = Some(rx);
             if processed >= max_events_per_tick {
-                PostMessageW(to_hwnd(hwnd), WM_APP, 0, 0);
+                win7ui::wake_window(to_hwnd(hwnd), WM_APP);
             }
         }
     }

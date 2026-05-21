@@ -35,6 +35,8 @@ The extracted layer currently provides:
 - native open/save file dialogs
 - global hotkey registration helper
 - `LogView` with clear, append, latest-output snapshot, and max-size protection
+- UI-thread event sender with `PostMessageW` wakeups
+- multiline editor/log controls and positioned buttons
 - path literal conversion for scripts
 
 Current module layout:
@@ -43,6 +45,7 @@ Current module layout:
 src/win7ui/
   controls.rs
   dialogs.rs
+  event.rs
   hotkey.rs
   layout.rs
   log_view.rs
@@ -57,7 +60,6 @@ The current Win7 application still owns the higher-level automation workflow. Fu
 ```text
 src/win7ui/
   app.rs
-  event.rs
   menu.rs
   status_bar.rs
 ```
