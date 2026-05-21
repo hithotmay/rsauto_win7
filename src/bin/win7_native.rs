@@ -12,7 +12,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::Receiver,
-        Arc, Mutex, OnceLock,
+        Arc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -150,7 +150,7 @@ enum AppEvent {
     },
 }
 
-static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
+static APP: win7ui::AppStore<AppState> = win7ui::AppStore::new();
 
 fn to_hwnd(value: isize) -> HWND {
     value as *mut c_void
@@ -166,7 +166,7 @@ fn main() {
         win7ui::register_class("PyAutoRsCaptureOverlay", Some(overlay_proc), null_mut());
         win7ui::register_class("PyAutoRsCaptureConfirm", Some(confirm_proc), (COLOR_WINDOW + 1) as _);
 
-        APP.set(Mutex::new(AppState::default())).ok();
+        APP.init_default();
 
         let hwnd =
             win7ui::create_main_window("PyAutoRsWin7Native", "PyAuto Rust Win7 Native", 1120, 780);

@@ -1,3 +1,4 @@
+pub mod app;
 pub mod controls;
 pub mod dialogs;
 pub mod event;
@@ -23,3 +24,4 @@ pub use text::{
     set_window_text, wide,
 };
 pub use window::{create_main_window, message_loop, register_class};
+pub use app::AppStore;

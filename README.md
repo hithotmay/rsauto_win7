@@ -36,6 +36,7 @@ The extracted layer currently provides:
 - global hotkey registration helper
 - `LogView` with clear, append, latest-output snapshot, and max-size protection
 - UI-thread event sender with `PostMessageW` wakeups
+- `AppStore<T>` for Win7 application shared state
 - multiline editor/log controls and positioned buttons
 - path literal conversion for scripts
 
@@ -43,6 +44,7 @@ Current module layout:
 
 ```text
 src/win7ui/
+  app.rs
   controls.rs
   dialogs.rs
   event.rs
@@ -59,7 +61,6 @@ The current Win7 application still owns the higher-level automation workflow. Fu
 
 ```text
 src/win7ui/
-  app.rs
   menu.rs
   status_bar.rs
 ```
