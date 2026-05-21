@@ -1,0 +1,6 @@
+/target
+captures/
+src/captures/
+output.png
+*.log
+*.tmp
