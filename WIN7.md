@@ -47,10 +47,10 @@ Current scope:
 - controls
 - edit/log helpers
 - native file dialogs
+- global hotkeys
 
 Planned scope:
 
-- global hotkey abstraction
 - capture overlay abstraction
 - log view with latest-line retention
 - simple layouts: absolute, row, split, anchor

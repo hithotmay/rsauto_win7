@@ -31,7 +31,7 @@ use windows_sys::Win32::{
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
-        Input::KeyboardAndMouse::{RegisterHotKey, ReleaseCapture, SetCapture, MOD_NOREPEAT, VK_ESCAPE},
+        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE},
         WindowsAndMessaging::*,
     },
 };
@@ -63,6 +63,8 @@ const VK_F11: u32 = 0x7A;
 const MAX_LOG_CHARS: i32 = 80_000;
 const MAX_RUN_LOG_LINES: usize = 1000;
 const LOG_SNAPSHOT_INTERVAL_MS: u64 = 160;
+const RUN_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_RUN, VK_F5);
+const STOP_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_STOP, VK_F11);
 
 const SAMPLE_SCRIPT: &str = r#"# Win7 原生模式：无 OpenGL，支持中文
 x = 1
@@ -191,10 +193,10 @@ fn main() {
             return;
         }
 
-        if RegisterHotKey(hwnd, HOTKEY_RUN, MOD_NOREPEAT, VK_F5) == 0 {
+        if !RUN_HOTKEY.register(hwnd) {
             append_log("F5 全局运行热键注册失败，可能被其他程序占用。");
         }
-        if RegisterHotKey(hwnd, HOTKEY_STOP, MOD_NOREPEAT, VK_F11) == 0 {
+        if !STOP_HOTKEY.register(hwnd) {
             append_log("F11 全局停止热键注册失败，可能被其他程序占用。");
         }
 
@@ -1195,48 +1197,23 @@ unsafe fn update_running_ui(running: bool) {
 }
 
 unsafe fn append_log(line: &str) {
-    append_log_text(&format!("{line}\r\n"));
+    log_view().append_line(line);
 }
 
 unsafe fn replace_log_snapshot(lines: &[String], total_lines: usize) {
-    let mut text = String::new();
-    if total_lines > lines.len() {
-        text.push_str(&format!(
-            "[本次运行日志超过 {MAX_RUN_LOG_LINES} 行，历史输出已省略]\r\n"
-        ));
-    }
-    for line in lines {
-        text.push_str(line);
-        text.push_str("\r\n");
-    }
-    set_log_text(&text);
+    log_view().replace_snapshot(lines, total_lines, MAX_RUN_LOG_LINES);
 }
 
 unsafe fn clear_log() {
-    set_log_text("");
+    log_view().clear();
 }
 
-unsafe fn set_log_text(text: &str) {
-    let Some(app) = APP.get() else { return; };
-    let log = to_hwnd(app.lock().unwrap().log);
-    win7ui::replace_edit_text(log, text, true);
-}
-
-unsafe fn append_log_text(text: &str) {
-    let Some(app) = APP.get() else { return; };
-    let log = to_hwnd(app.lock().unwrap().log);
-    if log.is_null() {
-        return;
-    }
-    if GetWindowTextLengthW(log) > MAX_LOG_CHARS {
-        win7ui::replace_edit_text(log, "[日志过多，仅保留最新输出]\r\n", true);
-    }
-    win7ui::append_edit_text(log, text);
-    if GetWindowTextLengthW(log) > MAX_LOG_CHARS {
-        let latest = text.to_string();
-        let replacement = format!("[日志过多，仅保留最新输出]\r\n{latest}");
-        win7ui::replace_edit_text(log, &replacement, true);
-    }
+unsafe fn log_view() -> win7ui::LogView {
+    let log = APP
+        .get()
+        .map(|app| to_hwnd(app.lock().unwrap().log))
+        .unwrap_or(null_mut());
+    win7ui::LogView::new(log, MAX_LOG_CHARS)
 }
 
 unsafe fn set_status(text: &str) {

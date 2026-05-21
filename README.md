@@ -25,7 +25,7 @@ The goal is to grow this into a practical Rust GUI library for Windows 7 tools:
 - easy single-file packaging
 - automation-friendly widgets such as editor, log view, file dialogs, global hotkeys, and screen capture overlays
 
-The first extracted layer already provides:
+The extracted layer currently provides:
 
 - wide string conversion
 - HWND helpers
@@ -33,19 +33,30 @@ The first extracted layer already provides:
 - edit text read/replace/append helpers
 - safe line insertion at the end of an editor
 - native open/save file dialogs
+- global hotkey registration helper
+- `LogView` with clear, append, latest-output snapshot, and max-size protection
 - path literal conversion for scripts
+
+Current module layout:
+
+```text
+src/win7ui/
+  dialogs.rs
+  hotkey.rs
+  log_view.rs
+  controls.rs
+  text.rs
+  mod.rs
+```
 
 The current Win7 application still owns the higher-level automation workflow. Future steps should move these into `win7ui` modules:
 
 ```text
 src/win7ui/
-  controls.rs
-  dialogs.rs
-  hotkey.rs
-  log_view.rs
   capture_overlay.rs
   layout.rs
   app.rs
+  event.rs
 ```
 
 ## Build
