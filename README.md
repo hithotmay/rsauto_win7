@@ -37,6 +37,7 @@ The extracted layer currently provides:
 - `LogView` with clear, append, latest-output snapshot, and max-size protection
 - UI-thread event sender with `PostMessageW` wakeups
 - `AppStore<T>` for Win7 application shared state
+- `AppShell` builder for class registration, main window creation, state init, and hotkey registration
 - multiline editor/log controls and positioned buttons
 - path literal conversion for scripts
 
@@ -55,6 +56,16 @@ src/win7ui/
   text.rs
   window.rs
   mod.rs
+```
+
+The Win7 binary now starts through `win7ui::AppShell`:
+
+```rust
+win7ui::AppShell::new()
+    .class("MainWindow", Some(wnd_proc), background)
+    .main_window("MainWindow", "Title", 1120, 780)
+    .hotkey(run_hotkey)
+    .start_with_store(&APP);
 ```
 
 The current Win7 application still owns the higher-level automation workflow. Future steps should move these into `win7ui` modules:

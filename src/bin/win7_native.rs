@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 
 #[path = "../core.rs"]
 mod core;
@@ -162,24 +162,24 @@ fn hwnd_value(value: HWND) -> isize {
 
 fn main() {
     unsafe {
-        win7ui::register_class("PyAutoRsWin7Native", Some(wnd_proc), (COLOR_WINDOW + 1) as _);
-        win7ui::register_class("PyAutoRsCaptureOverlay", Some(overlay_proc), null_mut());
-        win7ui::register_class("PyAutoRsCaptureConfirm", Some(confirm_proc), (COLOR_WINDOW + 1) as _);
-
-        APP.init_default();
-
-        let hwnd =
-            win7ui::create_main_window("PyAutoRsWin7Native", "PyAuto Rust Win7 Native", 1120, 780);
-
-        if hwnd.is_null() {
+        let Some(start) = win7ui::AppShell::new()
+            .class("PyAutoRsWin7Native", Some(wnd_proc), (COLOR_WINDOW + 1) as _)
+            .class("PyAutoRsCaptureOverlay", Some(overlay_proc), null_mut())
+            .class("PyAutoRsCaptureConfirm", Some(confirm_proc), (COLOR_WINDOW + 1) as _)
+            .main_window("PyAutoRsWin7Native", "PyAuto Rust Win7 Native", 1120, 780)
+            .hotkey(RUN_HOTKEY)
+            .hotkey(STOP_HOTKEY)
+            .start_with_store(&APP)
+        else {
             return;
-        }
+        };
 
-        if !RUN_HOTKEY.register(hwnd) {
-            append_log("F5 全局运行热键注册失败，可能被其他程序占用。");
-        }
-        if !STOP_HOTKEY.register(hwnd) {
-            append_log("F11 全局停止热键注册失败，可能被其他程序占用。");
+        for hotkey in start.failed_hotkeys {
+            match hotkey.id {
+                HOTKEY_RUN => append_log("F5 全局运行热键注册失败，可能被其他程序占用。"),
+                HOTKEY_STOP => append_log("F11 全局停止热键注册失败，可能被其他程序占用。"),
+                _ => {}
+            }
         }
 
         win7ui::message_loop();
