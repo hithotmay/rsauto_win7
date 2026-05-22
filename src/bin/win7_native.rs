@@ -138,7 +138,6 @@ struct CapturedScreen {
 }
 
 enum AppEvent {
-    Log(String),
     ReplaceLog {
         lines: Vec<String>,
         total_lines: usize,
@@ -330,40 +329,31 @@ unsafe fn start_script() {
     append_log("开始运行。");
     thread::spawn(move || {
         let log_stop = stop_requested.clone();
+        let mut tail_logs: VecDeque<String> = VecDeque::with_capacity(MAX_RUN_LOG_LINES);
+        let mut total_lines = 0usize;
         let result = Runner::new(stop_requested).and_then(|mut runner| {
-            let mut tail_logs: VecDeque<String> = VecDeque::with_capacity(MAX_RUN_LOG_LINES);
             let mut last_flush = Instant::now();
-            let mut total_lines = 0usize;
 
             runner.run_script(&script, |msg| {
                 if log_stop.load(Ordering::Relaxed) {
                     return;
                 }
-                total_lines += 1;
-                if tail_logs.len() >= MAX_RUN_LOG_LINES {
-                    tail_logs.pop_front();
-                }
-                tail_logs.push_back(msg);
+                push_tail_log(&mut tail_logs, &mut total_lines, msg);
 
                 if last_flush.elapsed() >= Duration::from_millis(LOG_SNAPSHOT_INTERVAL_MS) {
                     send_log_snapshot(&tx, &tail_logs, total_lines);
                     last_flush = Instant::now();
                 }
             })?;
-            send_log_snapshot(&tx, &tail_logs, total_lines);
             Ok(())
         });
-        match result {
-            Ok(()) => {
-                let _ = tx.send(AppEvent::Log("运行完成。".to_string()));
-            }
-            Err(RunError::Stopped) => {
-                let _ = tx.send(AppEvent::Log("运行已停止。".to_string()));
-            }
-            Err(err) => {
-                let _ = tx.send(AppEvent::Log(format!("错误：{err}")));
-            }
-        }
+        let final_line = match result {
+            Ok(()) => "运行完成。".to_string(),
+            Err(RunError::Stopped) => "运行已停止。".to_string(),
+            Err(err) => format!("错误：{err}"),
+        };
+        push_tail_log(&mut tail_logs, &mut total_lines, final_line);
+        send_log_snapshot(&tx, &tail_logs, total_lines);
         let _ = tx.send(AppEvent::Done);
         unsafe { tx.wake(); }
     });
@@ -392,6 +382,14 @@ fn send_log_snapshot(
         total_lines,
     });
     unsafe { tx.wake(); }
+}
+
+fn push_tail_log(tail_logs: &mut VecDeque<String>, total_lines: &mut usize, line: String) {
+    *total_lines += 1;
+    if tail_logs.len() >= MAX_RUN_LOG_LINES {
+        tail_logs.pop_front();
+    }
+    tail_logs.push_back(line);
 }
 
 unsafe fn open_script() {
@@ -961,7 +959,6 @@ unsafe fn drain_events() {
     while let Ok(event) = rx.try_recv() {
         processed += 1;
         match event {
-            AppEvent::Log(line) => append_log(&line),
             AppEvent::ReplaceLog { lines, total_lines } => replace_log_snapshot(&lines, total_lines),
             AppEvent::Done => {
                 keep = false;
