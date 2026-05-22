@@ -227,16 +227,49 @@ impl Value {
             Value::Bool(value) => value.to_string(),
         }
     }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            Value::Number(value) if value.fract() == 0.0 => "int",
+            Value::Number(_) => "float",
+            Value::Text(_) => "str",
+            Value::Bool(_) => "bool",
+        }
+    }
+
+    fn to_int(&self, line_no: usize) -> Result<i64, RunError> {
+        match self {
+            Value::Number(value) => Ok(*value as i64),
+            Value::Bool(value) => Ok(if *value { 1 } else { 0 }),
+            Value::Text(value) => value
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| line_error(line_no, &format!("cannot convert to int: {value}"))),
+        }
+    }
+
+    fn to_float(&self, line_no: usize) -> Result<f64, RunError> {
+        match self {
+            Value::Number(value) => Ok(*value),
+            Value::Bool(value) => Ok(if *value { 1.0 } else { 0.0 }),
+            Value::Text(value) => value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| line_error(line_no, &format!("cannot convert to float: {value}"))),
+        }
+    }
 }
 
 enum Flow {
     Continue,
+    Break,
+    ContinueLoop,
     Goto(String),
 }
 
 struct ScriptInterpreter {
     lines: Vec<ScriptLine>,
-    vars: HashMap<String, Value>,
+    scopes: Vec<HashMap<String, Value>>,
     labels: HashMap<String, usize>,
     functions: HashMap<String, FunctionDef>,
     steps: usize,
@@ -261,7 +294,7 @@ impl ScriptInterpreter {
 
         let mut interpreter = Self {
             lines,
-            vars: HashMap::new(),
+            scopes: vec![HashMap::new()],
             labels: HashMap::new(),
             functions: HashMap::new(),
             steps: 0,
@@ -280,6 +313,10 @@ impl ScriptInterpreter {
             match self.execute_at(pc, runner, log)? {
                 (Flow::Continue, next) => pc = next,
                 (Flow::Goto(label), _) => pc = self.goto_target(&label, self.lines[pc].line_no)?,
+                (Flow::Break, _) => return Err(line_error(self.lines[pc].line_no, "break outside loop")),
+                (Flow::ContinueLoop, _) => {
+                    return Err(line_error(self.lines[pc].line_no, "continue outside loop"));
+                }
             }
         }
         Ok(())
@@ -337,7 +374,7 @@ impl ScriptInterpreter {
             runner.check_stop()?;
             match self.execute_at(pc, runner, log)? {
                 (Flow::Continue, next) => pc = next,
-                (flow @ Flow::Goto(_), _) => return Ok(flow),
+                (flow @ (Flow::Break | Flow::ContinueLoop | Flow::Goto(_)), _) => return Ok(flow),
             }
         }
         Ok(Flow::Continue)
@@ -370,17 +407,34 @@ impl ScriptInterpreter {
             let (_, end) = self.block_bounds(pc)?;
             return Ok((Flow::Continue, end));
         }
+        if text.starts_with("if ") {
+            return self.execute_if_chain(pc, runner, log);
+        }
+        if text.starts_with("elif ") || text == "else:" {
+            return Err(line_error(
+                line.line_no,
+                "elif/else must follow an if block at the same indent",
+            ));
+        }
         if let Some(label) = text.strip_prefix("goto ") {
             return Ok((Flow::Goto(label.trim().to_string()), pc + 1));
+        }
+        if text == "break" {
+            return Ok((Flow::Break, pc + 1));
+        }
+        if text == "continue" {
+            return Ok((Flow::ContinueLoop, pc + 1));
         }
         if text.starts_with("for ") {
             let (var, values) = self.parse_for(text, line.line_no)?;
             let (body_start, body_end) = self.block_bounds(pc)?;
             for value in values {
                 runner.check_stop()?;
-                self.vars.insert(var.clone(), Value::Number(value as f64));
+                self.set_var(&var, Value::Number(value as f64));
                 match self.execute_block(body_start, body_end, runner, log)? {
                     Flow::Continue => {}
+                    Flow::ContinueLoop => continue,
+                    Flow::Break => break,
                     flow @ Flow::Goto(_) => return Ok((flow, pc + 1)),
                 }
             }
@@ -401,6 +455,8 @@ impl ScriptInterpreter {
                 }
                 match self.execute_block(body_start, body_end, runner, log)? {
                     Flow::Continue => {}
+                    Flow::ContinueLoop => continue,
+                    Flow::Break => break,
                     flow @ Flow::Goto(_) => return Ok((flow, pc + 1)),
                 }
             }
@@ -409,6 +465,68 @@ impl ScriptInterpreter {
 
         self.execute_statement(text, line.line_no, runner, log)?;
         Ok((Flow::Continue, pc + 1))
+    }
+
+    fn execute_if_chain<F>(
+        &mut self,
+        start: usize,
+        runner: &mut Runner,
+        log: &mut F,
+    ) -> Result<(Flow, usize), RunError>
+    where
+        F: FnMut(String),
+    {
+        let base_indent = self.lines[start].indent;
+        let mut branch = start;
+        loop {
+            let line = self.lines[branch].clone();
+            let condition = if let Some(condition) = line
+                .text
+                .strip_prefix("if ")
+                .or_else(|| line.text.strip_prefix("elif "))
+            {
+                Some(condition.strip_suffix(':').ok_or_else(|| {
+                    line_error(line.line_no, "if/elif statement must end with ':'")
+                })?)
+            } else if line.text == "else:" {
+                None
+            } else {
+                return Err(line_error(line.line_no, "invalid if/elif/else branch"));
+            };
+
+            let (body_start, body_end) = self.block_bounds(branch)?;
+            let chain_end = self.if_chain_end(body_end, base_indent)?;
+            let should_run = match condition {
+                Some(condition) => self.eval_expr(condition, line.line_no)?.as_bool(),
+                None => true,
+            };
+            if should_run {
+                let flow = self.execute_block(body_start, body_end, runner, log)?;
+                return Ok((flow, chain_end));
+            }
+
+            if let Some(next_branch) = self.next_if_branch(body_end, base_indent) {
+                branch = next_branch;
+            } else {
+                return Ok((Flow::Continue, chain_end));
+            }
+        }
+    }
+
+    fn next_if_branch(&self, index: usize, base_indent: usize) -> Option<usize> {
+        let line = self.lines.get(index)?;
+        (line.indent == base_indent
+            && (line.text.starts_with("elif ") || line.text == "else:"))
+            .then_some(index)
+    }
+
+    fn if_chain_end(&self, index: usize, base_indent: usize) -> Result<usize, RunError> {
+        let mut end = index;
+        while let Some(branch) = self.next_if_branch(end, base_indent) {
+            let (_, body_end) = self.block_bounds(branch)?;
+            end = body_end;
+        }
+        Ok(end)
     }
 
     fn execute_statement<F>(
@@ -435,7 +553,7 @@ impl ScriptInterpreter {
 
         if let Some((name, expr)) = split_assignment(text) {
             let value = self.eval_expr(expr, line_no)?;
-            self.vars.insert(name.trim().to_string(), value);
+            self.set_var(name.trim(), value);
             return Ok(());
         }
 
@@ -476,23 +594,21 @@ impl ScriptInterpreter {
             return Err(line_error(line_no, "function argument count mismatch"));
         }
 
-        let mut old_values = Vec::new();
+        self.scopes.push(HashMap::new());
         for (param, value) in params.iter().zip(args) {
-            old_values.push((param.clone(), self.vars.insert(param.clone(), value)));
+            self.set_var(param, value);
         }
 
         let result = self.execute_block(function.body_start, function.body_end, runner, log);
-
-        for (param, old_value) in old_values {
-            if let Some(value) = old_value {
-                self.vars.insert(param, value);
-            } else {
-                self.vars.remove(&param);
-            }
-        }
+        self.scopes.pop();
 
         match result? {
             Flow::Continue => Ok(()),
+            Flow::Break => Err(line_error(line_no, "break from inside function is not supported")),
+            Flow::ContinueLoop => Err(line_error(
+                line_no,
+                "continue from inside function is not supported",
+            )),
             Flow::Goto(label) => Err(line_error(
                 line_no,
                 &format!("goto from inside function is not supported: {label}"),
@@ -557,7 +673,7 @@ impl ScriptInterpreter {
         }
         let mut resolved = vec![tokens[0].clone()];
         for token in tokens.iter().skip(1) {
-            if self.vars.contains_key(token) || looks_like_expr(token) {
+            if self.get_var(token).is_some() || looks_like_expr(token) {
                 resolved.push(self.eval_expr(token, line_no)?.to_script_string());
             } else {
                 resolved.push(token.clone());
@@ -605,6 +721,16 @@ impl ScriptInterpreter {
         }
     }
 
+    fn get_var(&self, name: &str) -> Option<&Value> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn set_var(&mut self, name: &str, value: Value) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), value);
+        }
+    }
+
     fn eval_expr(&mut self, expr: &str, line_no: usize) -> Result<Value, RunError> {
         let expr = expr.trim();
         if expr.is_empty() {
@@ -616,6 +742,11 @@ impl ScriptInterpreter {
         if let Some(value) = parse_quoted(expr) {
             return Ok(Value::Text(value));
         }
+        if let Some((name, args)) = parse_call(expr) {
+            if let Some(value) = self.eval_builtin(name, args, line_no)? {
+                return Ok(value);
+            }
+        }
         for op in ["==", "!=", ">=", "<=", ">", "<"] {
             if let Some((left, right)) = split_outside(expr, op) {
                 let left = self.eval_expr(left, line_no)?;
@@ -626,7 +757,7 @@ impl ScriptInterpreter {
         if let Some(value) = self.eval_arithmetic(expr, line_no)? {
             return Ok(Value::Number(value));
         }
-        if let Some(value) = self.vars.get(expr) {
+        if let Some(value) = self.get_var(expr) {
             return Ok(value.clone());
         }
         if expr.eq_ignore_ascii_case("true") {
@@ -636,6 +767,47 @@ impl ScriptInterpreter {
             return Ok(Value::Bool(false));
         }
         Ok(Value::Text(expr.to_string()))
+    }
+
+    fn eval_builtin(
+        &mut self,
+        name: &str,
+        args: &str,
+        line_no: usize,
+    ) -> Result<Option<Value>, RunError> {
+        let args = split_args(args);
+        let name = name.trim();
+        match name {
+            "str" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                Ok(Some(Value::Text(
+                    self.eval_expr(arg, line_no)?.to_script_string(),
+                )))
+            }
+            "int" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                Ok(Some(Value::Number(
+                    self.eval_expr(arg, line_no)?.to_int(line_no)? as f64,
+                )))
+            }
+            "float" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                Ok(Some(Value::Number(
+                    self.eval_expr(arg, line_no)?.to_float(line_no)?,
+                )))
+            }
+            "bool" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                Ok(Some(Value::Bool(self.eval_expr(arg, line_no)?.as_bool())))
+            }
+            "type" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                Ok(Some(Value::Text(
+                    self.eval_expr(arg, line_no)?.type_name().to_string(),
+                )))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn eval_f_string(&mut self, template: &str, line_no: usize) -> Result<String, RunError> {
@@ -664,13 +836,22 @@ impl ScriptInterpreter {
                     if !found_end {
                         return Err(line_error(line_no, "f-string missing }"));
                     }
-                    out.push_str(&self.eval_expr(&expr, line_no)?.to_script_string());
+                    out.push_str(&self.eval_f_string_expr(&expr, line_no)?);
                 }
                 '}' => return Err(line_error(line_no, "f-string has extra }")),
                 _ => out.push(ch),
             }
         }
         Ok(out)
+    }
+
+    fn eval_f_string_expr(&mut self, expr: &str, line_no: usize) -> Result<String, RunError> {
+        let (expr, spec) = split_format_spec(expr);
+        let value = self.eval_expr(expr, line_no)?;
+        if let Some(spec) = spec {
+            return format_value(&value, spec, line_no);
+        }
+        Ok(value.to_script_string())
     }
 
     fn eval_arithmetic(&mut self, expr: &str, line_no: usize) -> Result<Option<f64>, RunError> {
@@ -690,7 +871,7 @@ impl ScriptInterpreter {
                 }));
             }
         }
-        if let Some(value) = self.vars.get(expr) {
+        if let Some(value) = self.get_var(expr) {
             return match value {
                 Value::Number(value) => Ok(Some(*value)),
                 Value::Bool(value) => Ok(Some(if *value { 1.0 } else { 0.0 })),
@@ -730,7 +911,13 @@ fn parse_label_name(text: &str) -> Option<&str> {
     if let Some(name) = text.strip_prefix("label ") {
         return Some(name.trim());
     }
-    if text.starts_with("def ") || text.starts_with("for ") || text.starts_with("while ") {
+    if text.starts_with("def ")
+        || text.starts_with("for ")
+        || text.starts_with("while ")
+        || text.starts_with("if ")
+        || text.starts_with("elif ")
+        || text == "else:"
+    {
         return None;
     }
     text.strip_suffix(':')
@@ -813,6 +1000,16 @@ fn split_args(args: &str) -> Vec<String> {
     out
 }
 
+fn expect_one_arg<'a>(name: &str, args: &'a [String], line_no: usize) -> Result<&'a str, RunError> {
+    if args.len() != 1 {
+        return Err(line_error(
+            line_no,
+            &format!("{name}() expects exactly 1 argument"),
+        ));
+    }
+    Ok(args[0].as_str())
+}
+
 fn split_assignment(text: &str) -> Option<(&str, &str)> {
     if text.contains("==") || text.contains("!=") || text.contains(">=") || text.contains("<=") {
         return None;
@@ -871,6 +1068,56 @@ fn split_outside<'a>(text: &'a str, needle: &str) -> Option<(&'a str, &'a str)> 
         }
     }
     None
+}
+
+fn split_format_spec(text: &str) -> (&str, Option<&str>) {
+    let mut quote: Option<char> = None;
+    let mut depth = 0_i32;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '"' | '\'' => {
+                quote = if quote == Some(ch) {
+                    None
+                } else if quote.is_none() {
+                    Some(ch)
+                } else {
+                    quote
+                };
+            }
+            '(' if quote.is_none() => depth += 1,
+            ')' if quote.is_none() => depth -= 1,
+            ':' if quote.is_none() && depth == 0 => {
+                return (&text[..idx], Some(text[idx + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    (text, None)
+}
+
+fn format_value(value: &Value, spec: &str, line_no: usize) -> Result<String, RunError> {
+    if spec.is_empty() {
+        return Ok(value.to_script_string());
+    }
+    let Some(precision) = spec.strip_prefix('.') else {
+        return Err(line_error(
+            line_no,
+            &format!("unsupported f-string format specifier: {spec}"),
+        ));
+    };
+    let precision = precision
+        .strip_suffix('f')
+        .unwrap_or(precision)
+        .parse::<usize>()
+        .map_err(|_| line_error(line_no, &format!("invalid f-string precision: {spec}")))?;
+    match value {
+        Value::Number(value) => Ok(format!("{value:.precision$}")),
+        Value::Bool(value) => Ok(format!("{:.precision$}", if *value { 1.0 } else { 0.0 })),
+        Value::Text(value) => value
+            .parse::<f64>()
+            .map(|value| format!("{value:.precision$}"))
+            .map_err(|_| line_error(line_no, "f-string numeric format requires a number")),
+    }
 }
 
 fn split_last_operator<'a>(
@@ -1512,5 +1759,41 @@ pub enum RunError {
     Image(#[from] image::ImageError),
     #[error("image search error: {0}")]
     ImageSearch(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evals_f_string_format_specs_and_conversions() {
+        let mut interpreter = ScriptInterpreter::new("").unwrap();
+        interpreter.set_var("x", Value::Number(3.14159));
+        interpreter.set_var("name", Value::Text("7".to_string()));
+
+        let formatted = interpreter.eval_expr("f'{x:.2f}'", 1).unwrap();
+        assert_eq!(formatted.to_script_string(), "3.14");
+
+        let int_value = interpreter.eval_expr("int(name) + 5", 1).unwrap();
+        assert_eq!(int_value.to_script_string(), "12");
+
+        let type_name = interpreter.eval_expr("type(x)", 1).unwrap();
+        assert_eq!(type_name.to_script_string(), "float");
+    }
+
+    #[test]
+    fn function_scope_reads_globals_but_keeps_assignments_local() {
+        let mut interpreter = ScriptInterpreter::new("").unwrap();
+        interpreter.set_var("x", Value::Number(10.0));
+        interpreter.scopes.push(HashMap::new());
+        let y = interpreter.eval_expr("x + 5", 1).unwrap();
+        interpreter.set_var("y", y);
+        interpreter.set_var("x", Value::Number(1.0));
+        assert_eq!(interpreter.eval_expr("y", 1).unwrap().to_script_string(), "15");
+        interpreter.scopes.pop();
+
+        assert_eq!(interpreter.eval_expr("x", 1).unwrap().to_script_string(), "10");
+        assert!(interpreter.get_var("y").is_none());
+    }
 }
 

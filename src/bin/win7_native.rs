@@ -65,6 +65,19 @@ const SAMPLE_SCRIPT: &str = r#"# Win7 原生模式：无 OpenGL，支持中文
 x = 1
 print(f'你好，x = {x}')
 
+# Python 风格语法示例：
+# def hello(name):
+#     local_x = int("2") + 3
+#     print(f'{name}: {local_x:.2f}, type={type(local_x)}')
+# hello("测试")
+#
+# for i in range(10):
+#     if i == 3:
+#         continue
+#     if i == 8:
+#         break
+#     print(i)
+#
 # click(500, 300)
 # sleep(500)
 # find_click("captures/click_image.png", 0.92, 3000)
