@@ -1266,7 +1266,7 @@ unsafe fn refresh_editor_view() {
     let script = to_hwnd(app.lock().unwrap().script);
     let text = win7ui::get_window_text(script);
     let spans = highlight_script_spans(&text);
-    win7ui::RichEdit::new(script).apply_highlights(text.encode_utf16().count(), &spans, win7ui::rgb(32, 32, 32));
+    win7ui::RichEdit::new(script).apply_highlights(rich_edit_text_units(&text), &spans, color_default());
     refresh_line_numbers();
 }
 
@@ -1309,9 +1309,23 @@ fn highlight_script_spans(text: &str) -> Vec<win7ui::HighlightSpan> {
     let mut pos = 0usize;
     for line in text.split_inclusive('\n') {
         highlight_line_spans(line, pos, &mut spans);
-        pos += line.encode_utf16().count();
+        pos += rich_edit_text_units(line);
     }
     spans
+}
+
+fn rich_edit_text_units(text: &str) -> usize {
+    let mut units = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+            units += 1;
+        } else {
+            units += ch.len_utf16();
+        }
+    }
+    units
 }
 
 fn highlight_line_spans(line: &str, base: usize, spans: &mut Vec<win7ui::HighlightSpan>) {
