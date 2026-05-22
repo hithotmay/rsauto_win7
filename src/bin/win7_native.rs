@@ -102,6 +102,7 @@ struct AppState {
     capture_button: isize,
     click_image_button: isize,
     capture_point_button: isize,
+    ui_font: isize,
     editor_font: isize,
     log_font: isize,
     running: bool,
@@ -271,11 +272,12 @@ unsafe extern "system" fn script_edit_proc(
 unsafe fn destroy_fonts() {
     if let Some(app) = APP.get() {
         let mut app = app.lock().unwrap();
-        for font in [app.editor_font, app.log_font] {
+        for font in [app.ui_font, app.editor_font, app.log_font] {
             if font != 0 {
                 DeleteObject(font as _);
             }
         }
+        app.ui_font = 0;
         app.editor_font = 0;
         app.log_font = 0;
     }
@@ -304,8 +306,22 @@ unsafe fn create_controls(hwnd: HWND) {
         true,
     );
     let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
-    let editor_font = create_editor_font(18);
-    let log_font = create_editor_font(16);
+    let ui_font = create_ui_font(16);
+    let editor_font = create_fixed_font(16);
+    let log_font = create_fixed_font(15);
+    apply_control_font(status, ui_font);
+    for control in [
+        open_button,
+        save_button,
+        save_as_button,
+        run_button,
+        stop_button,
+        capture_button,
+        click_image_button,
+        capture_point_button,
+    ] {
+        apply_control_font(control, ui_font);
+    }
     apply_control_font(script, editor_font);
     apply_control_font(log, log_font);
     subclass_script_editor(script);
@@ -324,6 +340,7 @@ unsafe fn create_controls(hwnd: HWND) {
         app.capture_button = hwnd_value(capture_button);
         app.click_image_button = hwnd_value(click_image_button);
         app.capture_point_button = hwnd_value(capture_point_button);
+        app.ui_font = ui_font as isize;
         app.editor_font = editor_font as isize;
         app.log_font = log_font as isize;
     }
@@ -332,7 +349,15 @@ unsafe fn create_controls(hwnd: HWND) {
     layout_controls(hwnd);
 }
 
-unsafe fn create_editor_font(height: i32) -> HWND {
+unsafe fn create_ui_font(height: i32) -> HWND {
+    create_font("Microsoft YaHei", height, false)
+}
+
+unsafe fn create_fixed_font(height: i32) -> HWND {
+    create_font("NSimSun", height, true)
+}
+
+unsafe fn create_font(face: &str, height: i32, fixed: bool) -> HWND {
     CreateFontW(
         -height,
         0,
@@ -346,8 +371,12 @@ unsafe fn create_editor_font(height: i32) -> HWND {
         OUT_DEFAULT_PRECIS as u32,
         CLIP_DEFAULT_PRECIS as u32,
         DEFAULT_QUALITY as u32,
-        (FIXED_PITCH | FF_MODERN) as u32,
-        win7ui::wide("Consolas").as_ptr(),
+        if fixed {
+            (FIXED_PITCH | FF_MODERN) as u32
+        } else {
+            0
+        },
+        win7ui::wide(face).as_ptr(),
     ) as HWND
 }
 
@@ -355,6 +384,12 @@ unsafe fn apply_control_font(hwnd: HWND, font: HWND) {
     if !hwnd.is_null() && !font.is_null() {
         SendMessageW(hwnd, WM_SETFONT, font as WPARAM, 1);
     }
+}
+
+unsafe fn current_ui_font() -> HWND {
+    APP.get()
+        .map(|app| app.lock().unwrap().ui_font as HWND)
+        .unwrap_or(null_mut())
 }
 
 unsafe fn subclass_script_editor(hwnd: HWND) {
@@ -837,32 +872,52 @@ unsafe fn create_confirm_controls(hwnd: HWND) {
         )
     };
 
-    win7ui::create_label(hwnd, "目录", 18, 20, 70, 22);
+    let dir_label = win7ui::create_label(hwnd, "目录", 18, 20, 70, 22);
     let dir_edit =
         win7ui::create_single_line_edit(hwnd, "captures", IDC_CONFIRM_DIR, 90, 18, 430, 24);
 
-    win7ui::create_label(hwnd, "文件名", 18, 55, 70, 22);
+    let file_label = win7ui::create_label(hwnd, "文件名", 18, 55, 70, 22);
     let file_edit =
         win7ui::create_single_line_edit(hwnd, &file_name, IDC_CONFIRM_FILE, 90, 53, 430, 24);
 
-    win7ui::create_label(hwnd, &selected_text, 90, 86, 430, 22);
+    let selected_label = win7ui::create_label(hwnd, &selected_text, 90, 86, 430, 22);
 
     let mut threshold_edit = null_mut();
     let mut timeout_edit = null_mut();
+    let mut threshold_label = null_mut();
+    let mut timeout_label = null_mut();
     let mut y = 116;
     if mode == CaptureMode::ClickImage {
-        win7ui::create_label(hwnd, "匹配阈值", 18, 92, 70, 22);
+        threshold_label = win7ui::create_label(hwnd, "匹配阈值", 18, 92, 70, 22);
         threshold_edit =
             win7ui::create_single_line_edit(hwnd, "0.92", IDC_CONFIRM_THRESHOLD, 90, 90, 90, 24);
-        win7ui::create_label(hwnd, "超时 ms", 205, 92, 70, 22);
+        timeout_label = win7ui::create_label(hwnd, "超时 ms", 205, 92, 70, 22);
         timeout_edit =
             win7ui::create_single_line_edit(hwnd, "3000", IDC_CONFIRM_TIMEOUT, 275, 90, 90, 24);
         y = 150;
     }
 
-    win7ui::create_button_at(hwnd, "确认", IDC_CONFIRM_OK, 210, y, 82, 28);
-    win7ui::create_button_at(hwnd, "重选", IDC_CONFIRM_RESELECT, 310, y, 82, 28);
-    win7ui::create_button_at(hwnd, "取消", IDC_CONFIRM_CANCEL, 410, y, 82, 28);
+    let ok_button = win7ui::create_button_at(hwnd, "确认", IDC_CONFIRM_OK, 210, y, 82, 28);
+    let reselect_button = win7ui::create_button_at(hwnd, "重选", IDC_CONFIRM_RESELECT, 310, y, 82, 28);
+    let cancel_button = win7ui::create_button_at(hwnd, "取消", IDC_CONFIRM_CANCEL, 410, y, 82, 28);
+
+    let ui_font = current_ui_font();
+    for control in [
+        dir_label,
+        dir_edit,
+        file_label,
+        file_edit,
+        selected_label,
+        threshold_label,
+        threshold_edit,
+        timeout_label,
+        timeout_edit,
+        ok_button,
+        reselect_button,
+        cancel_button,
+    ] {
+        apply_control_font(control, ui_font);
+    }
 
     if let Some(app) = APP.get() {
         app.lock().unwrap().confirm = Some(ConfirmState {
