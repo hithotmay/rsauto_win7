@@ -262,6 +262,9 @@ unsafe extern "system" fn script_edit_proc(
         SendMessageW(hwnd, EM_REPLACESEL, 1, spaces.as_ptr() as LPARAM);
         return 0;
     }
+    if msg == WM_CHAR && wparam as u32 == VK_TAB as u32 {
+        return 0;
+    }
     CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam)
 }
 
