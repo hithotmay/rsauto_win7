@@ -24,17 +24,10 @@ use pyauto_rs::win7ui;
 use screenshots::Screen;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::{
-        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-        EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW, RedrawWindow, SelectClipRgn,
-        SelectObject, SetBkMode, SetTextAlign, SetTextColor, TextOutW, UpdateWindow, COLOR_WINDOW,
-        HDC, PAINTSTRUCT, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY,
-        TA_RIGHT, TA_TOP, TEXTMETRICW, TRANSPARENT,
-    },
+    Graphics::Gdi::{UpdateWindow, COLOR_WINDOW},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
-        Controls::EM_REPLACESEL,
-        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_DELETE, VK_ESCAPE, VK_TAB},
+        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE},
         WindowsAndMessaging::*,
     },
 };
@@ -60,8 +53,6 @@ const IDC_CONFIRM_CANCEL: i32 = 307;
 
 const HOTKEY_RUN: i32 = 201;
 const HOTKEY_STOP: i32 = 202;
-const TIMER_LINE_GUTTER_SYNC: usize = 301;
-const TIMER_SCRIPT_HIGHLIGHT: usize = 302;
 const VK_F5: u32 = 0x74;
 const VK_F11: u32 = 0x7A;
 const MAX_LOG_CHARS: i32 = 80_000;
@@ -69,8 +60,6 @@ const MAX_RUN_LOG_LINES: usize = 1000;
 const LOG_SNAPSHOT_INTERVAL_MS: u64 = 160;
 const RUN_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_RUN, VK_F5);
 const STOP_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_STOP, VK_F11);
-static mut SCRIPT_EDIT_PROC: WNDPROC = None;
-static mut LINE_NUMBER_GUTTER_PROC: WNDPROC = None;
 
 const SAMPLE_SCRIPT: &str = r#"# Win7 原生模式：无 OpenGL，支持中文
 x = 1
@@ -97,8 +86,7 @@ print(f'你好，x = {x}')
 #[derive(Default)]
 struct AppState {
     hwnd: isize,
-    script: isize,
-    line_numbers: isize,
+    editor: win7ui::CodeEditor,
     log: isize,
     status: isize,
     run_button: isize,
@@ -251,21 +239,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             drain_events();
             0
         }
-        WM_TIMER if wparam == TIMER_LINE_GUTTER_SYNC => {
-            KillTimer(hwnd, TIMER_LINE_GUTTER_SYNC);
+        WM_TIMER if handle_editor_timer(wparam) => 0,
+        msg if msg == win7ui::CODE_EDITOR_REFRESH_GUTTER => {
             refresh_line_numbers();
             0
         }
-        WM_TIMER if wparam == TIMER_SCRIPT_HIGHLIGHT => {
-            KillTimer(hwnd, TIMER_SCRIPT_HIGHLIGHT);
-            refresh_editor_view();
-            0
-        }
-        msg if msg == WM_APP + 2 => {
-            refresh_line_numbers();
-            0
-        }
-        msg if msg == WM_APP + 3 => {
+        msg if msg == win7ui::CODE_EDITOR_REFRESH_ALL => {
             refresh_editor_view();
             0
         }
@@ -276,34 +255,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-}
-
-unsafe extern "system" fn script_edit_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if msg == WM_KEYDOWN && wparam as u32 == VK_TAB as u32 {
-        let spaces = win7ui::wide("    ");
-        SendMessageW(hwnd, EM_REPLACESEL, 1, spaces.as_ptr() as LPARAM);
-        schedule_editor_highlight();
-        return 0;
-    }
-    if msg == WM_CHAR && wparam as u32 == VK_TAB as u32 {
-        return 0;
-    }
-    let result = CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam);
-    if matches!(msg, WM_CHAR | WM_IME_CHAR | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO) {
-        schedule_editor_highlight();
-    } else if msg == WM_KEYDOWN && wparam as u32 == VK_DELETE as u32 {
-        schedule_editor_highlight();
-    } else if msg == WM_MOUSEWHEEL {
-        schedule_line_number_refresh_after_wheel();
-    } else if matches!(msg, WM_KEYUP | WM_VSCROLL) {
-        PostMessageW(main_hwnd(), WM_APP + 2, 0, 0);
-    }
-    result
 }
 
 unsafe fn destroy_fonts() {
@@ -324,19 +275,9 @@ unsafe fn create_controls(hwnd: HWND) {
     let capture_point_button = win7ui::create_button(hwnd, "捕获坐标", IDC_CAPTURE_POINT);
 
     let status = win7ui::create_label(hwnd, "就绪。编辑器 Tab 会插入 4 个空格。", 10, 44, 400, 22);
-    let line_numbers = win7ui::create_line_number_gutter(hwnd, "1", 0, 10, 70, 48, 620);
-    let script = win7ui::RichEdit::create(
-        hwnd,
-        SAMPLE_SCRIPT,
-        IDC_SCRIPT,
-        62,
-        70,
-        598,
-        620,
-    )
-    .hwnd();
-    let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
     let fonts = win7ui::UiFonts::win7_defaults();
+    let editor = win7ui::CodeEditor::create(hwnd, SAMPLE_SCRIPT, IDC_SCRIPT, 10, 70, 650, 620, 48, fonts.editor);
+    let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
     win7ui::apply_font_handle(status, fonts.ui);
     win7ui::apply_font_handle_to_many(&[
         open_button,
@@ -348,17 +289,12 @@ unsafe fn create_controls(hwnd: HWND) {
         click_image_button,
         capture_point_button,
     ], fonts.ui);
-    win7ui::apply_font_handle(line_numbers, fonts.editor);
-    win7ui::apply_font_handle(script, fonts.editor);
     win7ui::apply_font_handle(log, fonts.log);
-    subclass_line_number_gutter(line_numbers);
-    subclass_script_editor(script);
 
     if let Some(app) = APP.get() {
         let mut app = app.lock().unwrap();
         app.hwnd = hwnd_value(hwnd);
-        app.script = hwnd_value(script);
-        app.line_numbers = hwnd_value(line_numbers);
+        app.editor = editor;
         app.log = hwnd_value(log);
         app.status = hwnd_value(status);
         app.run_button = hwnd_value(run_button);
@@ -382,165 +318,6 @@ unsafe fn current_ui_font() -> HWND {
         .map(|app| app.lock().unwrap().fonts.ui)
         .map(|font| font as HWND)
         .unwrap_or(null_mut())
-}
-
-unsafe fn subclass_script_editor(hwnd: HWND) {
-    if hwnd.is_null() {
-        return;
-    }
-    let previous = SetWindowLongPtrW(
-        hwnd,
-        GWLP_WNDPROC,
-        script_edit_proc as *const () as isize,
-    );
-    SCRIPT_EDIT_PROC = std::mem::transmute(previous);
-}
-
-unsafe extern "system" fn line_number_gutter_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_ERASEBKGND => {
-            erase_line_number_gutter(hwnd, wparam as HDC);
-            1
-        }
-        WM_PAINT => {
-            paint_line_number_gutter(hwnd);
-            0
-        }
-        WM_MOUSEWHEEL => {
-            if let Some(app) = APP.get() {
-                let script = to_hwnd(app.lock().unwrap().script);
-                if !script.is_null() {
-                    SendMessageW(script, msg, wparam, lparam);
-                }
-            }
-            schedule_line_number_refresh_after_wheel();
-            0
-        }
-        _ => CallWindowProcW(LINE_NUMBER_GUTTER_PROC, hwnd, msg, wparam, lparam),
-    }
-}
-
-unsafe fn subclass_line_number_gutter(hwnd: HWND) {
-    if hwnd.is_null() {
-        return;
-    }
-    let previous = SetWindowLongPtrW(
-        hwnd,
-        GWLP_WNDPROC,
-        line_number_gutter_proc as *const () as isize,
-    );
-    LINE_NUMBER_GUTTER_PROC = std::mem::transmute(previous);
-}
-
-unsafe fn paint_line_number_gutter(hwnd: HWND) {
-    let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    SelectClipRgn(hdc, null_mut());
-
-    let mut rect = std::mem::zeroed();
-    GetClientRect(hwnd, &mut rect);
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-
-    let mem_dc = CreateCompatibleDC(hdc);
-    let bitmap = if !mem_dc.is_null() && width > 0 && height > 0 {
-        CreateCompatibleBitmap(hdc, width, height)
-    } else {
-        null_mut()
-    };
-
-    if !mem_dc.is_null() && !bitmap.is_null() {
-        let old_bitmap = SelectObject(mem_dc, bitmap as _);
-        draw_line_number_gutter(hwnd, mem_dc);
-        BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
-        if !old_bitmap.is_null() {
-            SelectObject(mem_dc, old_bitmap);
-        }
-        DeleteObject(bitmap as _);
-        DeleteDC(mem_dc);
-    } else {
-        draw_line_number_gutter(hwnd, hdc);
-        if !bitmap.is_null() {
-            DeleteObject(bitmap as _);
-        }
-        if !mem_dc.is_null() {
-            DeleteDC(mem_dc);
-        }
-    }
-
-    EndPaint(hwnd, &ps);
-}
-
-unsafe fn erase_line_number_gutter(hwnd: HWND, hdc: HDC) {
-    if hdc.is_null() {
-        return;
-    }
-    let mut rect = std::mem::zeroed();
-    GetClientRect(hwnd, &mut rect);
-    FillRect(hdc, &rect, GetSysColorBrush(COLOR_WINDOW));
-}
-
-unsafe fn draw_line_number_gutter(hwnd: HWND, hdc: HDC) {
-    if hdc.is_null() {
-        return;
-    }
-
-    erase_line_number_gutter(hwnd, hdc);
-    let mut rect = std::mem::zeroed();
-    GetClientRect(hwnd, &mut rect);
-
-    let (script, font) = if let Some(app) = APP.get() {
-        let app = app.lock().unwrap();
-        (to_hwnd(app.script), app.fonts.editor)
-    } else {
-        (null_mut(), 0)
-    };
-
-    if !script.is_null() {
-        let old_font = if font != 0 {
-            SelectObject(hdc, font as _)
-        } else {
-            null_mut()
-        };
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextAlign(hdc, TA_RIGHT | TA_TOP);
-        SetTextColor(hdc, win7ui::rgb(86, 96, 112));
-
-        let mut metrics: TEXTMETRICW = std::mem::zeroed();
-        GetTextMetricsW(hdc, &mut metrics);
-        let line_height = (metrics.tmHeight + metrics.tmExternalLeading).max(16);
-        let editor = win7ui::RichEdit::new(script);
-        let line_count = editor.line_count();
-        let mut line = editor.first_visible_line();
-
-        while line < line_count {
-            let Some(y) = editor.line_top(line) else { break; };
-            if y > rect.bottom {
-                break;
-            }
-            if y + line_height >= rect.top {
-                let number = format!("{}", line + 1);
-                let number = win7ui::wide(&number);
-                TextOutW(
-                    hdc,
-                    rect.right - 6,
-                    y,
-                    number.as_ptr(),
-                    number.len().saturating_sub(1) as i32,
-                );
-            }
-            line += 1;
-        }
-
-        if !old_font.is_null() {
-            SelectObject(hdc, old_font);
-        }
-    }
 }
 
 unsafe fn layout_controls(hwnd: HWND) {
@@ -571,14 +348,7 @@ unsafe fn layout_controls(hwnd: HWND) {
         win7ui::move_window(to_hwnd(app.status), 10, 44, width - 20, 22);
 
         let split = win7ui::split_left_right(width, height, 10, 70, 10, 410, 250);
-        win7ui::move_window(to_hwnd(app.line_numbers), split.left_x, split.y, 48, split.h);
-        win7ui::move_window(
-            to_hwnd(app.script),
-            split.left_x + 52,
-            split.y,
-            split.left_w - 52,
-            split.h,
-        );
+        app.editor.layout(split.left_x, split.y, split.left_w, split.h, 48);
         win7ui::move_window(to_hwnd(app.log), split.right_x, split.y, split.right_w, split.h);
     }
 }
@@ -591,7 +361,7 @@ unsafe fn start_script() {
             append_log("脚本已经在运行，忽略重复运行请求。");
             return;
         }
-        let script = win7ui::get_window_text(to_hwnd(app.script));
+        let script = app.editor.text();
         let (tx, rx) = win7ui::event_channel(to_hwnd(app.hwnd), WM_APP);
         let stop_requested = Arc::new(AtomicBool::new(false));
         app.running = true;
@@ -687,7 +457,7 @@ unsafe fn open_script() {
         Ok(text) => {
             if let Some(app) = APP.get() {
                 let mut app = app.lock().unwrap();
-                win7ui::RichEdit::new(to_hwnd(app.script)).set_text(&text);
+                app.editor.set_text(&text);
                 app.current_file = Some(path.clone());
             }
             refresh_editor_view();
@@ -702,7 +472,7 @@ unsafe fn save_script(force_dialog: bool) {
     let (text, existing) = {
         let Some(app) = APP.get() else { return; };
         let app = app.lock().unwrap();
-        (win7ui::get_window_text(to_hwnd(app.script)), app.current_file.clone())
+        (app.editor.text(), app.current_file.clone())
     };
 
     let path = if force_dialog {
@@ -1256,480 +1026,31 @@ unsafe fn finish_capture() {
 
 unsafe fn insert_script_line(line: &str) {
     let Some(app) = APP.get() else { return; };
-    let script = to_hwnd(app.lock().unwrap().script);
-    win7ui::insert_line_at_end(script, line);
+    app.lock().unwrap().editor.insert_line_at_end(line);
     refresh_editor_view();
 }
 
 unsafe fn refresh_editor_view() {
     let Some(app) = APP.get() else { return; };
-    let script = to_hwnd(app.lock().unwrap().script);
-    let text = win7ui::get_window_text(script);
-    let spans = highlight_script_spans(&text);
-    win7ui::RichEdit::new(script).apply_highlights(rich_edit_text_units(&text), &spans, color_default());
-    refresh_line_numbers();
+    app.lock().unwrap().editor.refresh_all();
 }
 
 unsafe fn refresh_line_numbers() {
     let Some(app) = APP.get() else { return; };
-    let (script, line_numbers) = {
-        let app = app.lock().unwrap();
-        (to_hwnd(app.script), to_hwnd(app.line_numbers))
-    };
-    UpdateWindow(script);
-    RedrawWindow(
-        line_numbers,
-        null_mut(),
-        null_mut(),
-        RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_NOCHILDREN,
-    );
+    app.lock().unwrap().editor.refresh_gutter();
 }
 
-unsafe fn schedule_line_number_refresh_after_wheel() {
-    let hwnd = main_hwnd();
-    PostMessageW(hwnd, WM_APP + 2, 0, 0);
-    SetTimer(hwnd, TIMER_LINE_GUTTER_SYNC, 45, None);
-}
-
-unsafe fn schedule_editor_highlight() {
-    let hwnd = main_hwnd();
-    PostMessageW(hwnd, WM_APP + 2, 0, 0);
-    SetTimer(hwnd, TIMER_SCRIPT_HIGHLIGHT, 90, None);
+unsafe fn handle_editor_timer(timer_id: WPARAM) -> bool {
+    APP.get()
+        .map(|app| app.lock().unwrap().editor.handle_timer(timer_id))
+        .unwrap_or(false)
 }
 
 unsafe fn focus_script_line(line: usize) {
     let Some(app) = APP.get() else { return; };
-    let script = to_hwnd(app.lock().unwrap().script);
-    win7ui::RichEdit::new(script).focus_line(line);
+    app.lock().unwrap().editor.focus_line(line);
     set_status(&format!("运行出错，已定位到第 {line} 行。"));
 }
-
-fn highlight_script_spans(text: &str) -> Vec<win7ui::HighlightSpan> {
-    let mut spans = Vec::new();
-    let mut pos = 0usize;
-    for line in text.split_inclusive('\n') {
-        highlight_line_spans(line, pos, &mut spans);
-        pos += rich_edit_text_units(line);
-    }
-    spans
-}
-
-fn rich_edit_text_units(text: &str) -> usize {
-    let mut units = 0usize;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\r' && chars.peek() == Some(&'\n') {
-            chars.next();
-            units += 1;
-        } else {
-            units += ch.len_utf16();
-        }
-    }
-    units
-}
-
-fn highlight_line_spans(line: &str, base: usize, spans: &mut Vec<win7ui::HighlightSpan>) {
-    highlight_fragment_tokens(line, 0, 0, line.len(), base, spans, true);
-}
-
-fn highlight_fragment_tokens(
-    line: &str,
-    mut byte: usize,
-    mut unit: usize,
-    end_byte: usize,
-    base: usize,
-    spans: &mut Vec<win7ui::HighlightSpan>,
-    allow_comment: bool,
-) {
-    while byte < end_byte {
-        let Some(ch) = next_char(line, byte) else { break; };
-        if ch == '#' {
-            if allow_comment {
-                let (end_byte, end_unit) = token_end(line, byte, unit, end_byte, |c| c != '\r' && c != '\n');
-                push_span(spans, base + unit, base + end_unit, color_comment());
-                byte = end_byte;
-                unit = end_unit;
-                continue;
-            }
-        }
-        if let Some(start) = string_start(line, byte, unit, end_byte) {
-            let literal = string_literal_end(line, start.quote_byte, start.quote_unit, start.quote, end_byte);
-            push_span(spans, base + unit, base + literal.end_unit, color_string());
-            if start.is_f_string {
-                highlight_fstring_expressions(line, &literal, base, spans);
-            }
-            byte = literal.end_byte;
-            unit = literal.end_unit;
-            continue;
-        }
-        if starts_number(line, byte, end_byte) {
-            let (end_byte, end_unit) = number_token_end(line, byte, unit, end_byte);
-            push_span(spans, base + unit, base + end_unit, color_number());
-            byte = end_byte;
-            unit = end_unit;
-            continue;
-        }
-        if is_ident_start(ch) {
-            let (end_byte, end_unit) = token_end(line, byte, unit, end_byte, is_ident_continue);
-            let token = &line[byte..end_byte];
-            let color = if is_attribute_token(line, byte) {
-                None
-            } else if SCRIPT_KEYWORDS.contains(&token) {
-                Some(color_keyword())
-            } else if SCRIPT_BUILTINS.contains(&token) {
-                Some(color_builtin())
-            } else if SCRIPT_COMMANDS.contains(&token) {
-                Some(color_command())
-            } else {
-                None
-            };
-            if let Some(color) = color {
-                push_span(spans, base + unit, base + end_unit, color);
-            }
-            byte = end_byte;
-            unit = end_unit;
-            continue;
-        }
-        byte += ch.len_utf8();
-        unit += ch.len_utf16();
-    }
-}
-
-fn highlight_fstring_expressions(
-    line: &str,
-    literal: &StringLiteral,
-    base: usize,
-    spans: &mut Vec<win7ui::HighlightSpan>,
-) {
-    let mut byte = literal.content_start_byte;
-    let mut unit = literal.content_start_unit;
-    while byte < literal.content_end_byte {
-        let Some(ch) = next_char(line, byte) else { break; };
-        if ch == '{' {
-            let (next_byte, next_unit) = advance_char(byte, unit, ch);
-            if next_char(line, next_byte) == Some('{') {
-                byte = next_byte + 1;
-                unit = next_unit + 1;
-                continue;
-            }
-            let expr_start_unit = unit;
-            let expr_inner_byte = next_byte;
-            let expr_inner_unit = next_unit;
-            byte = next_byte;
-            unit = next_unit;
-            let mut depth = 1usize;
-            while byte < literal.content_end_byte {
-                let Some(inner_ch) = next_char(line, byte) else { break; };
-                if let Some(start) = string_start(line, byte, unit, literal.content_end_byte) {
-                    let inner_literal =
-                        string_literal_end(line, start.quote_byte, start.quote_unit, start.quote, literal.content_end_byte);
-                    byte = inner_literal.end_byte;
-                    unit = inner_literal.end_unit;
-                    continue;
-                }
-                if inner_ch == '{' {
-                    let (next_byte, next_unit) = advance_char(byte, unit, inner_ch);
-                    if next_char(line, next_byte) == Some('{') {
-                        byte = next_byte + 1;
-                        unit = next_unit + 1;
-                    } else {
-                        depth += 1;
-                        byte = next_byte;
-                        unit = next_unit;
-                    }
-                    continue;
-                }
-                if inner_ch == '}' {
-                    let close_byte = byte;
-                    let (next_byte, next_unit) = advance_char(byte, unit, inner_ch);
-                    depth = depth.saturating_sub(1);
-                    byte = next_byte;
-                    unit = next_unit;
-                    if depth == 0 {
-                        push_span(spans, base + expr_start_unit, base + unit, color_default());
-                        highlight_fragment_tokens(
-                            line,
-                            expr_inner_byte,
-                            expr_inner_unit,
-                            close_byte,
-                            base,
-                            spans,
-                            false,
-                        );
-                        break;
-                    }
-                    continue;
-                }
-                let (next_byte, next_unit) = advance_char(byte, unit, inner_ch);
-                byte = next_byte;
-                unit = next_unit;
-            }
-            continue;
-        }
-        if ch == '}' {
-            let (next_byte, next_unit) = advance_char(byte, unit, ch);
-            if next_char(line, next_byte) == Some('}') {
-                byte = next_byte + 1;
-                unit = next_unit + 1;
-                continue;
-            }
-        }
-        let (next_byte, next_unit) = advance_char(byte, unit, ch);
-        byte = next_byte;
-        unit = next_unit;
-    }
-}
-
-#[derive(Clone, Copy)]
-struct StringStart {
-    quote_byte: usize,
-    quote_unit: usize,
-    quote: char,
-    is_f_string: bool,
-}
-
-#[derive(Clone, Copy)]
-struct StringLiteral {
-    end_byte: usize,
-    end_unit: usize,
-    content_start_byte: usize,
-    content_start_unit: usize,
-    content_end_byte: usize,
-}
-
-fn string_start(line: &str, byte: usize, unit: usize, end_byte: usize) -> Option<StringStart> {
-    let ch = next_char(line, byte)?;
-    if (ch == '"' || ch == '\'') && byte < end_byte {
-        return Some(StringStart {
-            quote_byte: byte,
-            quote_unit: unit,
-            quote: ch,
-            is_f_string: false,
-        });
-    }
-    if !ch.is_ascii_alphabetic() {
-        return None;
-    }
-    let (prefix_end_byte, prefix_end_unit) =
-        token_end(line, byte, unit, end_byte, |c| c.is_ascii_alphabetic());
-    let prefix = &line[byte..prefix_end_byte];
-    if !is_string_prefix(prefix) {
-        return None;
-    }
-    let quote = next_char(line, prefix_end_byte)?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    Some(StringStart {
-        quote_byte: prefix_end_byte,
-        quote_unit: prefix_end_unit,
-        quote,
-        is_f_string: prefix.chars().any(|c| c == 'f' || c == 'F'),
-    })
-}
-
-fn string_literal_end(line: &str, quote_byte: usize, quote_unit: usize, quote: char, end_byte: usize) -> StringLiteral {
-    let triple = line[quote_byte..].starts_with(&quote.to_string().repeat(3));
-    let quote_len = if triple { 3 } else { 1 };
-    let mut byte = quote_byte + quote_len;
-    let mut unit = quote_unit + quote_len;
-    let content_start_byte = byte;
-    let content_start_unit = unit;
-    let mut content_end_byte = byte;
-    let mut content_end_unit = unit;
-    let mut escaped = false;
-    while byte < end_byte {
-        let Some(ch) = next_char(line, byte) else { break; };
-        if ch == '\r' || ch == '\n' {
-            break;
-        }
-        if triple {
-            if line[byte..].starts_with(&quote.to_string().repeat(3)) {
-                return StringLiteral {
-                    end_byte: byte + 3,
-                    end_unit: unit + 3,
-                    content_start_byte,
-                    content_start_unit,
-                    content_end_byte: byte,
-                };
-            }
-        } else if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == quote {
-            return StringLiteral {
-                end_byte: byte + ch.len_utf8(),
-                end_unit: unit + ch.len_utf16(),
-                content_start_byte,
-                content_start_unit,
-                content_end_byte,
-            };
-        }
-        let (next_byte, next_unit) = advance_char(byte, unit, ch);
-        byte = next_byte;
-        unit = next_unit;
-        content_end_byte = byte;
-        content_end_unit = unit;
-    }
-    StringLiteral {
-        end_byte: content_end_byte,
-        end_unit: content_end_unit,
-        content_start_byte,
-        content_start_unit,
-        content_end_byte,
-    }
-}
-
-fn is_string_prefix(prefix: &str) -> bool {
-    if prefix.is_empty() || prefix.len() > 3 {
-        return false;
-    }
-    let mut has_f = false;
-    let mut has_r = false;
-    let mut has_b = false;
-    let mut has_u = false;
-    for ch in prefix.chars() {
-        match ch.to_ascii_lowercase() {
-            'f' if !has_f => has_f = true,
-            'r' if !has_r => has_r = true,
-            'b' if !has_b => has_b = true,
-            'u' if !has_u => has_u = true,
-            _ => return false,
-        }
-    }
-    !(has_f && has_b)
-}
-
-fn starts_number(line: &str, byte: usize, end_byte: usize) -> bool {
-    let Some(ch) = next_char(line, byte) else { return false; };
-    if ch.is_ascii_digit() {
-        return true;
-    }
-    ch == '.' && byte + 1 < end_byte && line[byte + 1..].chars().next().is_some_and(|c| c.is_ascii_digit())
-}
-
-fn number_token_end(line: &str, mut byte: usize, mut unit: usize, end_byte: usize) -> (usize, usize) {
-    let mut prev = '\0';
-    while byte < end_byte {
-        let Some(ch) = next_char(line, byte) else { break; };
-        let keep = ch.is_ascii_alphanumeric()
-            || ch == '_'
-            || ch == '.'
-            || ((ch == '+' || ch == '-') && (prev == 'e' || prev == 'E'));
-        if !keep {
-            break;
-        }
-        let (next_byte, next_unit) = advance_char(byte, unit, ch);
-        byte = next_byte;
-        unit = next_unit;
-        prev = ch;
-    }
-    (byte, unit)
-}
-
-fn push_span(spans: &mut Vec<win7ui::HighlightSpan>, start: usize, end: usize, color: u32) {
-    if end > start {
-        spans.push(win7ui::HighlightSpan { start, end, color });
-    }
-}
-
-fn token_end(
-    line: &str,
-    mut byte: usize,
-    mut unit: usize,
-    end_byte: usize,
-    keep: impl Fn(char) -> bool,
-) -> (usize, usize) {
-    while byte < end_byte {
-        let Some(ch) = next_char(line, byte) else { break; };
-        if !keep(ch) {
-            break;
-        }
-        let (next_byte, next_unit) = advance_char(byte, unit, ch);
-        byte = next_byte;
-        unit = next_unit;
-    }
-    (byte, unit)
-}
-
-fn next_char(text: &str, byte: usize) -> Option<char> {
-    text.get(byte..)?.chars().next()
-}
-
-fn advance_char(byte: usize, unit: usize, ch: char) -> (usize, usize) {
-    (byte + ch.len_utf8(), unit + ch.len_utf16())
-}
-
-fn is_ident_start(ch: char) -> bool {
-    ch == '_' || ch.is_alphabetic()
-}
-
-fn is_ident_continue(ch: char) -> bool {
-    ch == '_' || ch.is_alphanumeric()
-}
-
-fn is_attribute_token(line: &str, byte: usize) -> bool {
-    line[..byte]
-        .chars()
-        .rev()
-        .find(|ch| !ch.is_whitespace())
-        .is_some_and(|ch| ch == '.')
-}
-
-fn color_default() -> u32 {
-    win7ui::rgb(32, 32, 32)
-}
-
-fn color_comment() -> u32 {
-    win7ui::rgb(105, 120, 105)
-}
-
-fn color_string() -> u32 {
-    win7ui::rgb(145, 92, 25)
-}
-
-fn color_number() -> u32 {
-    win7ui::rgb(110, 70, 175)
-}
-
-fn color_keyword() -> u32 {
-    win7ui::rgb(175, 45, 60)
-}
-
-fn color_builtin() -> u32 {
-    win7ui::rgb(25, 90, 185)
-}
-
-fn color_command() -> u32 {
-    win7ui::rgb(20, 135, 95)
-}
-
-const SCRIPT_KEYWORDS: &[&str] = &[
-    "and", "as", "assert", "break", "class", "continue", "def", "del", "elif", "else", "except",
-    "finally", "for", "from", "global", "goto", "if", "import", "in", "is", "label", "lambda",
-    "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield", "None",
-    "True", "False", "true", "false",
-];
-const SCRIPT_BUILTINS: &[&str] = &[
-    "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "len", "list", "max", "min",
-    "print", "range", "set", "str", "sum", "tuple", "type",
-];
-const SCRIPT_COMMANDS: &[&str] = &[
-    "click",
-    "move",
-    "sleep",
-    "screenshot",
-    "find",
-    "find_click",
-    "点击坐标",
-    "移动鼠标",
-    "输入文本",
-    "等待",
-    "截图",
-    "查找图片",
-    "查找图片并点击",
-];
 
 unsafe fn drain_events() {
     let rx = {

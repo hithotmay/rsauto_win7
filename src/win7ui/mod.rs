@@ -1,4 +1,5 @@
 pub mod app;
+pub mod code_editor;
 pub mod controls;
 pub mod dialogs;
 pub mod event;
@@ -11,6 +12,8 @@ pub mod rich_edit;
 pub mod text;
 pub mod window;
 
+pub use app::{AppShell, AppShellStart, AppStore};
+pub use code_editor::{CodeEditor, CODE_EDITOR_REFRESH_ALL, CODE_EDITOR_REFRESH_GUTTER};
 pub use controls::{
     create_button, create_button_at, create_label, create_line_number_gutter,
     create_multiline_edit, create_single_line_edit, enable_window, hwnd_value, module_handle,
@@ -32,4 +35,3 @@ pub use text::{
     set_window_text, wide,
 };
 pub use window::{create_main_window, message_loop, register_class};
-pub use app::{AppShell, AppShellStart, AppStore};
