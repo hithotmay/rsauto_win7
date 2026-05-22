@@ -7,7 +7,7 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::EnableWindow,
         WindowsAndMessaging::{
             CreateWindowExW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-            ES_NOHIDESEL, ES_READONLY, ES_RIGHT, ES_WANTRETURN, WS_CHILD, WS_HSCROLL, WS_VISIBLE,
+            ES_NOHIDESEL, ES_READONLY, ES_WANTRETURN, WS_CHILD, WS_HSCROLL, WS_VISIBLE,
             WS_VSCROLL, WS_EX_CLIENTEDGE,
         },
     },
@@ -114,16 +114,14 @@ pub unsafe fn create_line_number_gutter(
     w: i32,
     h: i32,
 ) -> HWND {
-    let class = wide("EDIT");
+    const SS_RIGHT: u32 = 0x0000_0002;
+    const SS_NOPREFIX: u32 = 0x0000_0080;
+    let class = wide("STATIC");
     CreateWindowExW(
         WS_EX_CLIENTEDGE,
         class.as_ptr(),
         wide(text).as_ptr(),
-        WS_CHILD
-            | WS_VISIBLE
-            | ES_MULTILINE as u32
-            | ES_READONLY as u32
-            | ES_RIGHT as u32,
+        WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOPREFIX,
         x,
         y,
         w,

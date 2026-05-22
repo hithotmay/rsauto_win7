@@ -24,7 +24,11 @@ use pyauto_rs::win7ui;
 use screenshots::Screen;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::{UpdateWindow, COLOR_WINDOW},
+    Graphics::Gdi::{
+        BeginPaint, EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW, InvalidateRect,
+        SelectObject, SetBkMode, SetTextAlign, SetTextColor, TextOutW, UpdateWindow, COLOR_WINDOW,
+        PAINTSTRUCT, TA_RIGHT, TA_TOP, TEXTMETRICW, TRANSPARENT,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::EM_REPLACESEL,
@@ -62,6 +66,7 @@ const LOG_SNAPSHOT_INTERVAL_MS: u64 = 160;
 const RUN_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_RUN, VK_F5);
 const STOP_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_STOP, VK_F11);
 static mut SCRIPT_EDIT_PROC: WNDPROC = None;
+static mut LINE_NUMBER_GUTTER_PROC: WNDPROC = None;
 
 const SAMPLE_SCRIPT: &str = r#"# Win7 原生模式：无 OpenGL，支持中文
 x = 1
@@ -328,6 +333,7 @@ unsafe fn create_controls(hwnd: HWND) {
     win7ui::apply_font_handle(line_numbers, fonts.editor);
     win7ui::apply_font_handle(script, fonts.editor);
     win7ui::apply_font_handle(log, fonts.log);
+    subclass_line_number_gutter(line_numbers);
     subclass_script_editor(script);
 
     if let Some(app) = APP.get() {
@@ -370,6 +376,92 @@ unsafe fn subclass_script_editor(hwnd: HWND) {
         script_edit_proc as *const () as isize,
     );
     SCRIPT_EDIT_PROC = std::mem::transmute(previous);
+}
+
+unsafe extern "system" fn line_number_gutter_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            paint_line_number_gutter(hwnd);
+            0
+        }
+        _ => CallWindowProcW(LINE_NUMBER_GUTTER_PROC, hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn subclass_line_number_gutter(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let previous = SetWindowLongPtrW(
+        hwnd,
+        GWLP_WNDPROC,
+        line_number_gutter_proc as *const () as isize,
+    );
+    LINE_NUMBER_GUTTER_PROC = std::mem::transmute(previous);
+}
+
+unsafe fn paint_line_number_gutter(hwnd: HWND) {
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+
+    let mut rect = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
+    FillRect(hdc, &rect, GetSysColorBrush(COLOR_WINDOW));
+
+    let (script, font) = if let Some(app) = APP.get() {
+        let app = app.lock().unwrap();
+        (to_hwnd(app.script), app.fonts.editor)
+    } else {
+        (null_mut(), 0)
+    };
+
+    if !script.is_null() {
+        let old_font = if font != 0 {
+            SelectObject(hdc, font as _)
+        } else {
+            null_mut()
+        };
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextAlign(hdc, TA_RIGHT | TA_TOP);
+        SetTextColor(hdc, win7ui::rgb(86, 96, 112));
+
+        let mut metrics: TEXTMETRICW = std::mem::zeroed();
+        GetTextMetricsW(hdc, &mut metrics);
+        let line_height = (metrics.tmHeight + metrics.tmExternalLeading).max(16);
+        let editor = win7ui::RichEdit::new(script);
+        let line_count = editor.line_count();
+        let mut line = editor.first_visible_line();
+
+        while line < line_count {
+            let Some(y) = editor.line_top(line) else { break; };
+            if y > rect.bottom {
+                break;
+            }
+            if y + line_height >= rect.top {
+                let number = format!("{}", line + 1);
+                let number = win7ui::wide(&number);
+                TextOutW(
+                    hdc,
+                    rect.right - 6,
+                    y,
+                    number.as_ptr(),
+                    number.len().saturating_sub(1) as i32,
+                );
+            }
+            line += 1;
+        }
+
+        if !old_font.is_null() {
+            SelectObject(hdc, old_font);
+        }
+    }
+
+    EndPaint(hwnd, &ps);
 }
 
 unsafe fn layout_controls(hwnd: HWND) {
@@ -1094,23 +1186,16 @@ unsafe fn refresh_editor_view() {
     let Some(app) = APP.get() else { return; };
     let script = to_hwnd(app.lock().unwrap().script);
     let text = win7ui::get_window_text(script);
-    refresh_line_numbers_with_text(script, &text);
     let spans = highlight_script_spans(&text);
     win7ui::RichEdit::new(script).apply_highlights(text.encode_utf16().count(), &spans, win7ui::rgb(32, 32, 32));
+    refresh_line_numbers();
 }
 
 unsafe fn refresh_line_numbers() {
     let Some(app) = APP.get() else { return; };
-    let script = to_hwnd(app.lock().unwrap().script);
-    let text = win7ui::get_window_text(script);
-    refresh_line_numbers_with_text(script, &text);
-}
-
-unsafe fn refresh_line_numbers_with_text(script: HWND, text: &str) {
-    let Some(app) = APP.get() else { return; };
     let line_numbers = to_hwnd(app.lock().unwrap().line_numbers);
-    let first_visible = win7ui::RichEdit::new(script).first_visible_line();
-    update_line_numbers(line_numbers, text, first_visible);
+    InvalidateRect(line_numbers, null_mut(), 1);
+    UpdateWindow(line_numbers);
 }
 
 unsafe fn focus_script_line(line: usize) {
@@ -1118,16 +1203,6 @@ unsafe fn focus_script_line(line: usize) {
     let script = to_hwnd(app.lock().unwrap().script);
     win7ui::RichEdit::new(script).focus_line(line);
     set_status(&format!("运行出错，已定位到第 {line} 行。"));
-}
-
-unsafe fn update_line_numbers(hwnd: HWND, text: &str, first_visible: usize) {
-    let count = text.split('\n').count().max(1);
-    let visible_count = 300usize.min(count.saturating_sub(first_visible).saturating_add(1));
-    let mut numbers = String::new();
-    for line in first_visible..first_visible.saturating_add(visible_count) {
-        numbers.push_str(&format!("{:>4}\r\n", line.saturating_add(1)));
-    }
-    win7ui::replace_edit_text(hwnd, &numbers, false);
 }
 
 fn highlight_script_spans(text: &str) -> Vec<win7ui::HighlightSpan> {

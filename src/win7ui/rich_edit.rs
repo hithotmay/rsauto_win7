@@ -22,6 +22,8 @@ use super::{module_handle, replace_edit_text, set_window_text, wide};
 const EM_EXSETSEL: u32 = 0x0400 + 55;
 const EM_EXGETSEL: u32 = 0x0400 + 52;
 const EM_SETCHARFORMAT: u32 = 0x0400 + 68;
+const EM_POSFROMCHAR_RICH: u32 = 0x0400 + 38;
+const EM_LINESCROLL: u32 = 0x00B6;
 const SCF_SELECTION: WPARAM = 0x0001;
 const CFM_COLOR: u32 = 0x40000000;
 
@@ -29,6 +31,12 @@ const CFM_COLOR: u32 = 0x40000000;
 struct CharRange {
     cp_min: i32,
     cp_max: i32,
+}
+
+#[repr(C)]
+struct PointL {
+    x: i32,
+    y: i32,
 }
 
 #[repr(C)]
@@ -165,13 +173,37 @@ impl RichEdit {
     }
 
     pub unsafe fn first_visible_line(self) -> usize {
-        SendMessageW(self.hwnd, EM_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize + 1
+        SendMessageW(self.hwnd, EM_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize
+    }
+
+    pub unsafe fn line_top(self, line: usize) -> Option<i32> {
+        let char_index = SendMessageW(self.hwnd, EM_LINEINDEX, line, 0);
+        if char_index < 0 {
+            return None;
+        }
+        let mut point = PointL { x: 0, y: 0 };
+        SendMessageW(
+            self.hwnd,
+            EM_POSFROMCHAR_RICH,
+            &mut point as *mut PointL as WPARAM,
+            char_index as LPARAM,
+        );
+        Some(point.y)
+    }
+
+    unsafe fn scroll_to_first_visible_line(self, target: usize) {
+        let current = self.first_visible_line();
+        let delta = target as isize - current as isize;
+        if delta != 0 {
+            SendMessageW(self.hwnd, EM_LINESCROLL, 0, delta as LPARAM);
+        }
     }
 
     pub unsafe fn apply_highlights(self, text_len: usize, spans: &[HighlightSpan], default_color: u32) {
         if self.hwnd.is_null() {
             return;
         }
+        let first_visible = self.first_visible_line();
         let mut original = CharRange {
             cp_min: 0,
             cp_max: 0,
@@ -193,6 +225,7 @@ impl RichEdit {
             0,
             &mut original as *mut CharRange as LPARAM,
         );
+        self.scroll_to_first_visible_line(first_visible);
         SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
         InvalidateRect(self.hwnd, null_mut(), 1);
     }
