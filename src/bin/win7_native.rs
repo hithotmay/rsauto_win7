@@ -24,10 +24,7 @@ use pyauto_rs::win7ui;
 use screenshots::Screen;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::{
-        CreateFontW, DeleteObject, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET,
-        DEFAULT_QUALITY, FF_MODERN, FIXED_PITCH, FW_NORMAL, OUT_DEFAULT_PRECIS, UpdateWindow,
-    },
+    Graphics::Gdi::{UpdateWindow, COLOR_WINDOW},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::EM_REPLACESEL,
@@ -102,9 +99,7 @@ struct AppState {
     capture_button: isize,
     click_image_button: isize,
     capture_point_button: isize,
-    ui_font: isize,
-    editor_font: isize,
-    log_font: isize,
+    fonts: win7ui::UiFonts,
     running: bool,
     stop_requested: Option<Arc<AtomicBool>>,
     rx: Option<Receiver<AppEvent>>,
@@ -272,14 +267,7 @@ unsafe extern "system" fn script_edit_proc(
 unsafe fn destroy_fonts() {
     if let Some(app) = APP.get() {
         let mut app = app.lock().unwrap();
-        for font in [app.ui_font, app.editor_font, app.log_font] {
-            if font != 0 {
-                DeleteObject(font as _);
-            }
-        }
-        app.ui_font = 0;
-        app.editor_font = 0;
-        app.log_font = 0;
+        app.fonts.destroy();
     }
 }
 
@@ -306,11 +294,9 @@ unsafe fn create_controls(hwnd: HWND) {
         true,
     );
     let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
-    let ui_font = create_ui_font(16);
-    let editor_font = create_fixed_font(16);
-    let log_font = create_fixed_font(15);
-    apply_control_font(status, ui_font);
-    for control in [
+    let fonts = win7ui::UiFonts::win7_defaults();
+    win7ui::apply_font_handle(status, fonts.ui);
+    win7ui::apply_font_handle_to_many(&[
         open_button,
         save_button,
         save_as_button,
@@ -319,11 +305,9 @@ unsafe fn create_controls(hwnd: HWND) {
         capture_button,
         click_image_button,
         capture_point_button,
-    ] {
-        apply_control_font(control, ui_font);
-    }
-    apply_control_font(script, editor_font);
-    apply_control_font(log, log_font);
+    ], fonts.ui);
+    win7ui::apply_font_handle(script, fonts.editor);
+    win7ui::apply_font_handle(log, fonts.log);
     subclass_script_editor(script);
 
     if let Some(app) = APP.get() {
@@ -340,55 +324,17 @@ unsafe fn create_controls(hwnd: HWND) {
         app.capture_button = hwnd_value(capture_button);
         app.click_image_button = hwnd_value(click_image_button);
         app.capture_point_button = hwnd_value(capture_point_button);
-        app.ui_font = ui_font as isize;
-        app.editor_font = editor_font as isize;
-        app.log_font = log_font as isize;
+        app.fonts = fonts;
     }
 
     update_running_ui(false);
     layout_controls(hwnd);
 }
 
-unsafe fn create_ui_font(height: i32) -> HWND {
-    create_font("Microsoft YaHei", height, false)
-}
-
-unsafe fn create_fixed_font(height: i32) -> HWND {
-    create_font("NSimSun", height, true)
-}
-
-unsafe fn create_font(face: &str, height: i32, fixed: bool) -> HWND {
-    CreateFontW(
-        -height,
-        0,
-        0,
-        0,
-        FW_NORMAL as i32,
-        0,
-        0,
-        0,
-        DEFAULT_CHARSET as u32,
-        OUT_DEFAULT_PRECIS as u32,
-        CLIP_DEFAULT_PRECIS as u32,
-        DEFAULT_QUALITY as u32,
-        if fixed {
-            (FIXED_PITCH | FF_MODERN) as u32
-        } else {
-            0
-        },
-        win7ui::wide(face).as_ptr(),
-    ) as HWND
-}
-
-unsafe fn apply_control_font(hwnd: HWND, font: HWND) {
-    if !hwnd.is_null() && !font.is_null() {
-        SendMessageW(hwnd, WM_SETFONT, font as WPARAM, 1);
-    }
-}
-
 unsafe fn current_ui_font() -> HWND {
     APP.get()
-        .map(|app| app.lock().unwrap().ui_font as HWND)
+        .map(|app| app.lock().unwrap().fonts.ui)
+        .map(|font| font as HWND)
         .unwrap_or(null_mut())
 }
 
@@ -916,7 +862,7 @@ unsafe fn create_confirm_controls(hwnd: HWND) {
         reselect_button,
         cancel_button,
     ] {
-        apply_control_font(control, ui_font);
+        win7ui::apply_font(control, ui_font);
     }
 
     if let Some(app) = APP.get() {
@@ -968,10 +914,14 @@ unsafe fn confirm_capture() {
             append_log(&format!("已保存图片：{}", path.display()));
             if mode == CaptureMode::ClickImage {
                 let code = format!(
-                    "find_click(\"{}\", {:.2}, {})",
+                    "find_click(\"{}\", {:.2}, {}, {}, {}, {}, {})",
                     win7ui::script_path_literal(&path),
                     threshold,
-                    timeout_ms
+                    timeout_ms,
+                    selected.left,
+                    selected.top,
+                    selected.width,
+                    selected.height
                 );
                 insert_script_line(&code);
                 append_log(&format!("已插入代码：{code}"));

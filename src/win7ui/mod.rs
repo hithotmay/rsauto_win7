@@ -2,6 +2,7 @@ pub mod app;
 pub mod controls;
 pub mod dialogs;
 pub mod event;
+pub mod font;
 pub mod hotkey;
 pub mod layout;
 pub mod log_view;
@@ -15,6 +16,10 @@ pub use controls::{
 };
 pub use dialogs::choose_file;
 pub use event::{event_channel, wake_window, UiEventSender};
+pub use font::{
+    apply_font, apply_font_handle, apply_font_handle_to_many, apply_font_to_many,
+    create_fixed_font, create_font, create_ui_font, destroy_font, UiFonts,
+};
 pub use hotkey::HotKey;
 pub use layout::{move_window, row_layout, split_left_right};
 pub use log_view::LogView;

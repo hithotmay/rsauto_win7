@@ -100,51 +100,58 @@ impl Runner {
                 captured.image.save(&path)?;
                 log(format!("screenshot saved: {}", path.display()));
             }
-            Command::Find { image, threshold } => {
+            Command::Find {
+                image,
+                threshold,
+                options,
+            } => {
                 let captured = capture_primary_screen_with_info()?;
                 let needle = load_template(&image)?;
-                let prepared = PreparedTemplate::new(&needle)?;
-                let found = find_prepared_template(
+                let found = find_template_with_options(
                     &captured.image,
-                    &prepared,
+                    &needle,
                     threshold,
+                    options,
                     Some(self.stop_requested.as_ref()),
                 )?;
                 log(format!(
-                    "found image {}, position ({}, {}), score {:.4}",
+                    "found image {}, position ({}, {}), score {:.4}, scale {:.2}",
                     image.display(),
                     found.x + captured.screen_x,
                     found.y + captured.screen_y,
-                    found.score
+                    found.score,
+                    found.scale
                 ));
             }
             Command::FindClick {
                 image,
                 threshold,
                 timeout_ms,
+                options,
             } => {
                 let deadline = Instant::now() + Duration::from_millis(timeout_ms);
                 let needle = load_template(&image)?;
-                let prepared = PreparedTemplate::new(&needle)?;
                 loop {
                     self.check_stop()?;
                     let captured = capture_primary_screen_with_info()?;
-                    match find_prepared_template(
+                    match find_template_with_options(
                         &captured.image,
-                        &prepared,
+                        &needle,
                         threshold,
+                        options,
                         Some(self.stop_requested.as_ref()),
                     ) {
                         Ok(found) => {
-                            let image_cx = found.x + (needle.width() as i32 / 2);
-                            let image_cy = found.y + (needle.height() as i32 / 2);
+                            let image_cx = found.x + (found.width as i32 / 2);
+                            let image_cy = found.y + (found.height as i32 / 2);
                             let (cx, cy) = captured.image_point_to_screen(image_cx, image_cy);
                             self.enigo.move_mouse(cx, cy, Coordinate::Abs)?;
                             self.enigo.button(Button::Left, Direction::Click)?;
                             log(format!(
-                                "found and clicked image {}, position ({cx}, {cy}), score {:.4}",
+                                "found and clicked image {}, position ({cx}, {cy}), score {:.4}, scale {:.2}",
                                 image.display(),
-                                found.score
+                                found.score,
+                                found.scale
                             ));
                             break;
                         }
@@ -1212,12 +1219,45 @@ enum Command {
     Find {
         image: PathBuf,
         threshold: f32,
+        options: ImageSearchOptions,
     },
     FindClick {
         image: PathBuf,
         threshold: f32,
         timeout_ms: u64,
+        options: ImageSearchOptions,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ImageSearchOptions {
+    region: Option<SearchRegion>,
+    scale: ScaleSearch,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScaleSearch {
+    min: f32,
+    max: f32,
+    step: f32,
+}
+
+impl Default for ScaleSearch {
+    fn default() -> Self {
+        Self {
+            min: 1.0,
+            max: 1.0,
+            step: 0.0,
+        }
+    }
 }
 
 fn parse_command(line: &str) -> Result<Command, RunError> {
@@ -1248,11 +1288,13 @@ fn parse_command(line: &str) -> Result<Command, RunError> {
         "find" | "查找图片" => Ok(Command::Find {
             image: parse_path(&tokens, 1, "image")?,
             threshold: parse_optional_f32(&tokens, 2, 0.92)?,
+            options: parse_image_search_options(&tokens, 3)?,
         }),
         "find_click" | "查找图片并点击" => Ok(Command::FindClick {
             image: parse_path(&tokens, 1, "image")?,
             threshold: parse_optional_f32(&tokens, 2, 0.92)?,
             timeout_ms: parse_optional_u64(&tokens, 3, 0)?,
+            options: parse_image_search_options(&tokens, 4)?,
         }),
         _ => Err(RunError::Parse(format!("unknown command: {command}"))),
     }
@@ -1331,6 +1373,42 @@ fn parse_path(tokens: &[String], index: usize, name: &str) -> Result<PathBuf, Ru
         .ok_or_else(|| RunError::Parse(format!("missing path argument {name}")))
 }
 
+fn parse_image_search_options(
+    tokens: &[String],
+    start: usize,
+) -> Result<ImageSearchOptions, RunError> {
+    let region = if tokens.len() >= start + 4 {
+        Some(SearchRegion {
+            x: parse_optional_u32(tokens, start, 0)?,
+            y: parse_optional_u32(tokens, start + 1, 0)?,
+            width: parse_optional_u32(tokens, start + 2, 0)?,
+            height: parse_optional_u32(tokens, start + 3, 0)?,
+        })
+        .filter(|region| region.width > 0 && region.height > 0)
+    } else {
+        None
+    };
+    let scale = if tokens.len() >= start + 7 {
+        ScaleSearch {
+            min: parse_optional_f32(tokens, start + 4, 1.0)?.max(0.2),
+            max: parse_optional_f32(tokens, start + 5, 1.0)?.max(0.2),
+            step: parse_optional_f32(tokens, start + 6, 0.0)?.max(0.0),
+        }
+    } else {
+        ScaleSearch::default()
+    };
+    Ok(ImageSearchOptions { region, scale })
+}
+
+fn parse_optional_u32(tokens: &[String], index: usize, default: u32) -> Result<u32, RunError> {
+    match tokens.get(index) {
+        Some(value) => value
+            .parse()
+            .map_err(|_| RunError::Parse(format!("not a valid integer: {value}"))),
+        None => Ok(default),
+    }
+}
+
 #[derive(Debug)]
 struct CapturedScreen {
     image: RgbaImage,
@@ -1379,7 +1457,10 @@ fn load_template(path: &Path) -> Result<RgbaImage, RunError> {
 struct MatchResult {
     x: i32,
     y: i32,
+    width: u32,
+    height: u32,
     score: f32,
+    scale: f32,
 }
 
 struct PreparedTemplate {
@@ -1423,7 +1504,10 @@ fn find_template(
     let mut best = MatchResult {
         x: 0,
         y: 0,
+        width: nw,
+        height: nh,
         score: -1.0,
+        scale: 1.0,
     };
 
     for y in 0..=(hh - nh) {
@@ -1442,7 +1526,10 @@ fn find_template(
                 best = MatchResult {
                     x: x as i32,
                     y: y as i32,
+                    width: nw,
+                    height: nh,
                     score,
+                    scale: 1.0,
                 };
             }
         }
@@ -1505,7 +1592,10 @@ fn find_prepared_template(
     let mut best = MatchResult {
         x: 0,
         y: 0,
+        width: needle.width,
+        height: needle.height,
         score: -1.0,
+        scale: 1.0,
     };
 
     for candidate in candidates {
@@ -1524,7 +1614,10 @@ fn find_prepared_template(
             best = MatchResult {
                 x: candidate.x,
                 y: candidate.y,
+                width: needle.width,
+                height: needle.height,
                 score,
+                scale: candidate.scale,
             };
         }
     }
@@ -1537,6 +1630,127 @@ fn find_prepared_template(
             best.score, threshold
         )))
     }
+}
+
+fn find_template_with_options(
+    haystack: &RgbaImage,
+    needle: &RgbaImage,
+    threshold: f32,
+    options: ImageSearchOptions,
+    stop_requested: Option<&AtomicBool>,
+) -> Result<MatchResult, RunError> {
+    let (search_image, offset_x, offset_y) = crop_search_region(haystack, options.region)?;
+    let mut best_match: Option<MatchResult> = None;
+    let mut best_error: Option<MatchResult> = None;
+
+    for scale in search_scales(options.scale) {
+        check_stop_flag(stop_requested)?;
+        let scaled = scale_template(needle, scale)?;
+        let prepared = PreparedTemplate::new(&scaled)?;
+        match find_prepared_template(&search_image, &prepared, threshold, stop_requested) {
+            Ok(mut found) => {
+                found.x += offset_x as i32;
+                found.y += offset_y as i32;
+                found.scale = scale;
+                if best_match
+                    .as_ref()
+                    .map(|best| found.score > best.score)
+                    .unwrap_or(true)
+                {
+                    best_match = Some(found);
+                }
+            }
+            Err(RunError::ImageSearch(message)) => {
+                if let Some(score) = parse_best_score(&message) {
+                    let candidate = MatchResult {
+                        x: offset_x as i32,
+                        y: offset_y as i32,
+                        width: scaled.width(),
+                        height: scaled.height(),
+                        score,
+                        scale,
+                    };
+                    if best_error
+                        .as_ref()
+                        .map(|best| candidate.score > best.score)
+                        .unwrap_or(true)
+                    {
+                        best_error = Some(candidate);
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if let Some(best) = best_match {
+        return Ok(best);
+    }
+
+    if let Some(best) = best_error {
+        Err(RunError::ImageSearch(format!(
+            "image not found; best score {:.4}, threshold {:.4}, scale {:.2}",
+            best.score, threshold, best.scale
+        )))
+    } else {
+        Err(RunError::ImageSearch(format!(
+            "image not found; threshold {:.4}",
+            threshold
+        )))
+    }
+}
+
+fn crop_search_region(
+    image: &RgbaImage,
+    region: Option<SearchRegion>,
+) -> Result<(RgbaImage, u32, u32), RunError> {
+    let Some(region) = region else {
+        return Ok((image.clone(), 0, 0));
+    };
+    let x = region.x.min(image.width());
+    let y = region.y.min(image.height());
+    let width = region.width.min(image.width().saturating_sub(x));
+    let height = region.height.min(image.height().saturating_sub(y));
+    if width == 0 || height == 0 {
+        return Err(RunError::ImageSearch("search region is empty".to_string()));
+    }
+    Ok((image::imageops::crop_imm(image, x, y, width, height).to_image(), x, y))
+}
+
+fn scale_template(needle: &RgbaImage, scale: f32) -> Result<RgbaImage, RunError> {
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        return Ok(needle.clone());
+    }
+    let width = ((needle.width() as f32 * scale).round() as u32).max(1);
+    let height = ((needle.height() as f32 * scale).round() as u32).max(1);
+    Ok(image::imageops::resize(
+        needle,
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    ))
+}
+
+fn search_scales(scale: ScaleSearch) -> Vec<f32> {
+    let min = scale.min.min(scale.max).max(0.2);
+    let max = scale.min.max(scale.max).max(0.2);
+    let step = scale.step.max(0.0);
+    if step <= f32::EPSILON || (max - min).abs() <= f32::EPSILON {
+        return vec![min];
+    }
+    let mut values = Vec::new();
+    let mut current = min;
+    while current <= max + f32::EPSILON && values.len() < 32 {
+        values.push((current * 100.0).round() / 100.0);
+        current += step;
+    }
+    values
+}
+
+fn parse_best_score(message: &str) -> Option<f32> {
+    let (_, tail) = message.split_once("best score ")?;
+    let score = tail.split_once(',').map(|(score, _)| score).unwrap_or(tail);
+    score.trim().parse().ok()
 }
 
 fn build_template_samples(gray: &[f32], width: u32, height: u32) -> Vec<TemplateSample> {
@@ -1580,7 +1794,10 @@ fn find_template_candidates(
     let mut best_sample = MatchResult {
         x: 0,
         y: 0,
+        width: needle.width,
+        height: needle.height,
         score: -1.0,
+        scale: 1.0,
     };
 
     for y in 0..=(haystack_height - needle.height) {
@@ -1591,7 +1808,10 @@ fn find_template_candidates(
                 best_sample = MatchResult {
                     x: x as i32,
                     y: y as i32,
+                    width: needle.width,
+                    height: needle.height,
                     score,
+                    scale: 1.0,
                 };
             }
             if score >= min_sample_score {
@@ -1600,7 +1820,10 @@ fn find_template_candidates(
                     MatchResult {
                         x: x as i32,
                         y: y as i32,
+                        width: needle.width,
+                        height: needle.height,
                         score,
+                        scale: 1.0,
                     },
                     MAX_FULL_CHECKS,
                 );
