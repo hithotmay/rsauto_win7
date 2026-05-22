@@ -60,6 +60,7 @@ const IDC_CONFIRM_CANCEL: i32 = 307;
 
 const HOTKEY_RUN: i32 = 201;
 const HOTKEY_STOP: i32 = 202;
+const TIMER_LINE_GUTTER_SYNC: usize = 301;
 const VK_F5: u32 = 0x74;
 const VK_F11: u32 = 0x7A;
 const MAX_LOG_CHARS: i32 = 80_000;
@@ -249,6 +250,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             drain_events();
             0
         }
+        WM_TIMER if wparam == TIMER_LINE_GUTTER_SYNC => {
+            KillTimer(hwnd, TIMER_LINE_GUTTER_SYNC);
+            refresh_line_numbers();
+            0
+        }
         msg if msg == WM_APP + 2 => {
             refresh_line_numbers();
             0
@@ -284,7 +290,9 @@ unsafe extern "system" fn script_edit_proc(
     let result = CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam);
     if matches!(msg, WM_CHAR | WM_PASTE | WM_CUT | WM_UNDO) {
         PostMessageW(main_hwnd(), WM_APP + 3, 0, 0);
-    } else if matches!(msg, WM_KEYUP | WM_VSCROLL | WM_MOUSEWHEEL) {
+    } else if msg == WM_MOUSEWHEEL {
+        schedule_line_number_refresh_after_wheel();
+    } else if matches!(msg, WM_KEYUP | WM_VSCROLL) {
         PostMessageW(main_hwnd(), WM_APP + 2, 0, 0);
     }
     result
@@ -402,6 +410,7 @@ unsafe extern "system" fn line_number_gutter_proc(
                     SendMessageW(script, msg, wparam, lparam);
                 }
             }
+            schedule_line_number_refresh_after_wheel();
             0
         }
         _ => CallWindowProcW(LINE_NUMBER_GUTTER_PROC, hwnd, msg, wparam, lparam),
@@ -1255,13 +1264,23 @@ unsafe fn refresh_editor_view() {
 
 unsafe fn refresh_line_numbers() {
     let Some(app) = APP.get() else { return; };
-    let line_numbers = to_hwnd(app.lock().unwrap().line_numbers);
+    let (script, line_numbers) = {
+        let app = app.lock().unwrap();
+        (to_hwnd(app.script), to_hwnd(app.line_numbers))
+    };
+    UpdateWindow(script);
     RedrawWindow(
         line_numbers,
         null_mut(),
         null_mut(),
         RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_NOCHILDREN,
     );
+}
+
+unsafe fn schedule_line_number_refresh_after_wheel() {
+    let hwnd = main_hwnd();
+    PostMessageW(hwnd, WM_APP + 2, 0, 0);
+    SetTimer(hwnd, TIMER_LINE_GUTTER_SYNC, 45, None);
 }
 
 unsafe fn focus_script_line(line: usize) {
