@@ -142,7 +142,7 @@ enum AppEvent {
         lines: Vec<String>,
         total_lines: usize,
     },
-    Done,
+    Done { status: String },
     CaptureReady {
         mode: CaptureMode,
         result: Result<CapturedScreen, String>,
@@ -347,14 +347,16 @@ unsafe fn start_script() {
             })?;
             Ok(())
         });
-        let final_line = match result {
-            Ok(()) => "运行完成。".to_string(),
-            Err(RunError::Stopped) => "运行已停止。".to_string(),
-            Err(err) => format!("错误：{err}"),
+        let (final_line, status) = match result {
+            Ok(()) => ("运行完成。".to_string(), "运行完成。"),
+            Err(RunError::Stopped) => ("运行已停止。".to_string(), "运行已停止。"),
+            Err(err) => (format!("错误：{err}"), "运行出错。"),
         };
         push_tail_log(&mut tail_logs, &mut total_lines, final_line);
         send_log_snapshot(&tx, &tail_logs, total_lines);
-        let _ = tx.send(AppEvent::Done);
+        let _ = tx.send(AppEvent::Done {
+            status: status.to_string(),
+        });
         unsafe { tx.wake(); }
     });
 }
@@ -962,7 +964,7 @@ unsafe fn drain_events() {
         processed += 1;
         match event {
             AppEvent::ReplaceLog { lines, total_lines } => replace_log_snapshot(&lines, total_lines),
-            AppEvent::Done => {
+            AppEvent::Done { status } => {
                 keep = false;
                 if let Some(app) = APP.get() {
                     let mut app = app.lock().unwrap();
@@ -970,6 +972,7 @@ unsafe fn drain_events() {
                     app.stop_requested = None;
                 }
                 update_running_ui(false);
+                set_status(&status);
             }
             AppEvent::CaptureReady { mode, result } => {
                 keep = false;

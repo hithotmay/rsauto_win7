@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -16,6 +16,9 @@ use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings
 use image::{imageops, DynamicImage, RgbaImage};
 use screenshots::Screen;
 use thiserror::Error;
+
+const MAX_RUN_LOG_LINES: usize = 1000;
+const LOG_SNAPSHOT_INTERVAL_MS: u64 = 80;
 
 const SAMPLE_SCRIPT: &str = r#"# PyAuto Rust MVP
 # 命令示例：
@@ -256,8 +259,8 @@ impl PyAutoApp {
                     }
                 }
                 AppEvent::StopRequested => self.stop_run(),
-                AppEvent::Log(line) => self.logs.push(line),
-                AppEvent::RunDone | AppEvent::CaptureReady { .. } => {}
+                AppEvent::Log(line) => self.append_log(line),
+                AppEvent::ReplaceRunLog { .. } | AppEvent::RunDone | AppEvent::CaptureReady { .. } => {}
             }
         }
 
@@ -267,7 +270,7 @@ impl PyAutoApp {
     fn start_run(&mut self) {
         self.running = true;
         self.logs.clear();
-        self.logs.push("开始运行。".to_string());
+        self.append_log("开始运行。".to_string());
 
         let script = self.script.clone();
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -276,23 +279,31 @@ impl PyAutoApp {
         self.rx = Some(rx);
 
         thread::spawn(move || {
+            let log_stop = stop_requested.clone();
+            let mut tail_logs: VecDeque<String> = VecDeque::with_capacity(MAX_RUN_LOG_LINES);
+            let mut total_lines = 0usize;
             let result = Runner::new(stop_requested.clone()).and_then(|mut runner| {
+                let mut last_flush = Instant::now();
                 runner.run_script(&script, |msg| {
-                    let _ = tx.send(AppEvent::Log(msg));
+                    if log_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    push_tail_log(&mut tail_logs, &mut total_lines, msg);
+
+                    if last_flush.elapsed() >= Duration::from_millis(LOG_SNAPSHOT_INTERVAL_MS) {
+                        send_run_log_snapshot(&tx, &tail_logs, total_lines);
+                        last_flush = Instant::now();
+                    }
                 })
             });
 
-            match result {
-                Ok(()) => {
-                    let _ = tx.send(AppEvent::Log("运行完成。".to_string()));
-                }
-                Err(RunError::Stopped) => {
-                    let _ = tx.send(AppEvent::Log("运行已停止。".to_string()));
-                }
-                Err(err) => {
-                    let _ = tx.send(AppEvent::Log(format!("错误：{err}")));
-                }
-            }
+            let final_line = match result {
+                Ok(()) => "运行完成。".to_string(),
+                Err(RunError::Stopped) => "运行已停止。".to_string(),
+                Err(err) => format!("错误：{err}"),
+            };
+            push_tail_log(&mut tail_logs, &mut total_lines, final_line);
+            send_run_log_snapshot(&tx, &tail_logs, total_lines);
             let _ = tx.send(AppEvent::RunDone);
         });
     }
@@ -300,7 +311,7 @@ impl PyAutoApp {
     fn stop_run(&mut self) {
         if let Some(stop_requested) = &self.stop_requested {
             stop_requested.store(true, Ordering::Relaxed);
-            self.logs.push("正在请求停止脚本...".to_string());
+            self.append_log("正在请求停止脚本...".to_string());
         }
     }
 
@@ -520,7 +531,10 @@ impl PyAutoApp {
         let mut keep_rx = true;
         while let Ok(event) = rx.try_recv() {
             match event {
-                AppEvent::Log(line) => self.logs.push(line),
+                AppEvent::Log(line) => self.append_log(line),
+                AppEvent::ReplaceRunLog { lines, total_lines } => {
+                    self.replace_run_log_snapshot(lines, total_lines);
+                }
                 AppEvent::RunDone => {
                     self.running = false;
                     self.stop_requested = None;
@@ -548,11 +562,61 @@ impl PyAutoApp {
             self.rx = Some(rx);
         }
     }
+
+    fn append_log(&mut self, line: String) {
+        self.logs.push(line);
+        if self.logs.len() > MAX_RUN_LOG_LINES + 1 {
+            let overflow = self.logs.len() - MAX_RUN_LOG_LINES;
+            self.logs.drain(0..overflow);
+            if self.logs.first().map(|line| !line.starts_with('[')).unwrap_or(true) {
+                self.logs.insert(
+                    0,
+                    format!("[日志超过 {MAX_RUN_LOG_LINES} 行，历史输出已省略]"),
+                );
+            }
+        }
+    }
+
+    fn replace_run_log_snapshot(&mut self, lines: Vec<String>, total_lines: usize) {
+        self.logs.clear();
+        if total_lines > lines.len() {
+            self.logs.push(format!(
+                "[本次运行日志超过 {MAX_RUN_LOG_LINES} 行，历史输出已省略]"
+            ));
+        }
+        self.logs.extend(lines);
+    }
+}
+
+fn send_run_log_snapshot(
+    tx: &mpsc::Sender<AppEvent>,
+    tail_logs: &VecDeque<String>,
+    total_lines: usize,
+) {
+    if tail_logs.is_empty() {
+        return;
+    }
+    let _ = tx.send(AppEvent::ReplaceRunLog {
+        lines: tail_logs.iter().cloned().collect(),
+        total_lines,
+    });
+}
+
+fn push_tail_log(tail_logs: &mut VecDeque<String>, total_lines: &mut usize, line: String) {
+    *total_lines += 1;
+    if tail_logs.len() >= MAX_RUN_LOG_LINES {
+        tail_logs.pop_front();
+    }
+    tail_logs.push_back(line);
 }
 
 #[derive(Debug)]
 enum AppEvent {
     Log(String),
+    ReplaceRunLog {
+        lines: Vec<String>,
+        total_lines: usize,
+    },
     RunDone,
     StartRequested,
     StopRequested,
