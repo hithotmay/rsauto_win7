@@ -24,10 +24,14 @@ use pyauto_rs::win7ui;
 use screenshots::Screen;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::{UpdateWindow, COLOR_WINDOW},
+    Graphics::Gdi::{
+        CreateFontW, DeleteObject, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET,
+        DEFAULT_QUALITY, FF_MODERN, FIXED_PITCH, FW_NORMAL, OUT_DEFAULT_PRECIS, UpdateWindow,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
-        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE},
+        Controls::EM_REPLACESEL,
+        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_TAB},
         WindowsAndMessaging::*,
     },
 };
@@ -60,6 +64,7 @@ const MAX_RUN_LOG_LINES: usize = 1000;
 const LOG_SNAPSHOT_INTERVAL_MS: u64 = 160;
 const RUN_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_RUN, VK_F5);
 const STOP_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_STOP, VK_F11);
+static mut SCRIPT_EDIT_PROC: WNDPROC = None;
 
 const SAMPLE_SCRIPT: &str = r#"# Win7 原生模式：无 OpenGL，支持中文
 x = 1
@@ -97,6 +102,8 @@ struct AppState {
     capture_button: isize,
     click_image_button: isize,
     capture_point_button: isize,
+    editor_font: isize,
+    log_font: isize,
     running: bool,
     stop_requested: Option<Arc<AtomicBool>>,
     rx: Option<Receiver<AppEvent>>,
@@ -236,10 +243,38 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_DESTROY => {
+            destroy_fonts();
             PostQuitMessage(0);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe extern "system" fn script_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN && wparam as u32 == VK_TAB as u32 {
+        let spaces = win7ui::wide("    ");
+        SendMessageW(hwnd, EM_REPLACESEL, 1, spaces.as_ptr() as LPARAM);
+        return 0;
+    }
+    CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam)
+}
+
+unsafe fn destroy_fonts() {
+    if let Some(app) = APP.get() {
+        let mut app = app.lock().unwrap();
+        for font in [app.editor_font, app.log_font] {
+            if font != 0 {
+                DeleteObject(font as _);
+            }
+        }
+        app.editor_font = 0;
+        app.log_font = 0;
     }
 }
 
@@ -253,7 +288,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let click_image_button = win7ui::create_button(hwnd, "点击截图", IDC_CLICK_IMAGE);
     let capture_point_button = win7ui::create_button(hwnd, "捕获坐标", IDC_CAPTURE_POINT);
 
-    let status = win7ui::create_label(hwnd, "就绪", 10, 44, 400, 22);
+    let status = win7ui::create_label(hwnd, "就绪。编辑器 Tab 会插入 4 个空格。", 10, 44, 400, 22);
     let script = win7ui::create_multiline_edit(
         hwnd,
         SAMPLE_SCRIPT,
@@ -266,6 +301,11 @@ unsafe fn create_controls(hwnd: HWND) {
         true,
     );
     let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
+    let editor_font = create_editor_font(18);
+    let log_font = create_editor_font(16);
+    apply_control_font(script, editor_font);
+    apply_control_font(log, log_font);
+    subclass_script_editor(script);
 
     if let Some(app) = APP.get() {
         let mut app = app.lock().unwrap();
@@ -281,10 +321,49 @@ unsafe fn create_controls(hwnd: HWND) {
         app.capture_button = hwnd_value(capture_button);
         app.click_image_button = hwnd_value(click_image_button);
         app.capture_point_button = hwnd_value(capture_point_button);
+        app.editor_font = editor_font as isize;
+        app.log_font = log_font as isize;
     }
 
     update_running_ui(false);
     layout_controls(hwnd);
+}
+
+unsafe fn create_editor_font(height: i32) -> HWND {
+    CreateFontW(
+        -height,
+        0,
+        0,
+        0,
+        FW_NORMAL as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        OUT_DEFAULT_PRECIS as u32,
+        CLIP_DEFAULT_PRECIS as u32,
+        DEFAULT_QUALITY as u32,
+        (FIXED_PITCH | FF_MODERN) as u32,
+        win7ui::wide("Consolas").as_ptr(),
+    ) as HWND
+}
+
+unsafe fn apply_control_font(hwnd: HWND, font: HWND) {
+    if !hwnd.is_null() && !font.is_null() {
+        SendMessageW(hwnd, WM_SETFONT, font as WPARAM, 1);
+    }
+}
+
+unsafe fn subclass_script_editor(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let previous = SetWindowLongPtrW(
+        hwnd,
+        GWLP_WNDPROC,
+        script_edit_proc as *const () as isize,
+    );
+    SCRIPT_EDIT_PROC = std::mem::transmute(previous);
 }
 
 unsafe fn layout_controls(hwnd: HWND) {

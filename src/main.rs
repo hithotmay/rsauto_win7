@@ -12,6 +12,7 @@ use std::{
 };
 
 use eframe::egui;
+use egui::{text::LayoutJob, Color32, FontId, TextFormat};
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use image::{imageops, DynamicImage, RgbaImage};
 use screenshots::Screen;
@@ -84,6 +85,15 @@ fn configure_chinese_fonts(ctx: &egui::Context) {
     }
 
     ctx.set_fonts(fonts);
+
+    let mut style = (*ctx.style()).clone();
+    style
+        .text_styles
+        .insert(egui::TextStyle::Monospace, FontId::monospace(15.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+    ctx.set_style(style);
 }
 
 struct PyAutoApp {
@@ -214,9 +224,15 @@ impl eframe::App for PyAutoApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("脚本编辑器");
             ui.separator();
+            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                let mut job = highlight_script(text.as_str(), ui.visuals().dark_mode);
+                job.wrap.max_width = wrap_width;
+                ui.fonts_mut(|fonts| fonts.layout_job(job))
+            };
             ui.add(
                 egui::TextEdit::multiline(&mut self.script)
                     .code_editor()
+                    .layouter(&mut layouter)
                     .desired_rows(28)
                     .lock_focus(true)
                     .desired_width(f32::INFINITY),
@@ -587,6 +603,157 @@ impl PyAutoApp {
         self.logs.extend(lines);
     }
 }
+
+fn highlight_script(code: &str, dark_mode: bool) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let plain = script_text_format(SyntaxKind::Plain, dark_mode);
+    for line in code.split_inclusive('\n') {
+        highlight_line(&mut job, line, dark_mode);
+    }
+    if code.is_empty() {
+        job.append("", 0.0, plain);
+    }
+    job
+}
+
+fn highlight_line(job: &mut LayoutJob, line: &str, dark_mode: bool) {
+    let plain = script_text_format(SyntaxKind::Plain, dark_mode);
+    let mut index = 0usize;
+    let chars = line.char_indices().collect::<Vec<_>>();
+    while index < chars.len() {
+        let (start, ch) = chars[index];
+        if ch == '#' {
+            job.append(&line[start..], 0.0, script_text_format(SyntaxKind::Comment, dark_mode));
+            return;
+        }
+        if ch == '"' || ch == '\'' {
+            let end = string_end(line, start, ch);
+            job.append(&line[start..end], 0.0, script_text_format(SyntaxKind::String, dark_mode));
+            index = chars.partition_point(|(idx, _)| *idx < end);
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            let end = token_end(line, start, |c| c.is_ascii_digit() || c == '.');
+            job.append(&line[start..end], 0.0, script_text_format(SyntaxKind::Number, dark_mode));
+            index = chars.partition_point(|(idx, _)| *idx < end);
+            continue;
+        }
+        if is_ident_start(ch) {
+            let end = token_end(line, start, is_ident_continue);
+            let token = &line[start..end];
+            let kind = if SCRIPT_KEYWORDS.contains(&token) {
+                SyntaxKind::Keyword
+            } else if SCRIPT_BUILTINS.contains(&token) {
+                SyntaxKind::Builtin
+            } else if SCRIPT_COMMANDS.contains(&token) {
+                SyntaxKind::Command
+            } else {
+                SyntaxKind::Plain
+            };
+            job.append(token, 0.0, script_text_format(kind, dark_mode));
+            index = chars.partition_point(|(idx, _)| *idx < end);
+            continue;
+        }
+        let end = start + ch.len_utf8();
+        job.append(&line[start..end], 0.0, plain.clone());
+        index += 1;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SyntaxKind {
+    Plain,
+    Keyword,
+    Builtin,
+    Command,
+    String,
+    Number,
+    Comment,
+}
+
+fn script_text_format(kind: SyntaxKind, dark_mode: bool) -> TextFormat {
+    let color = match (kind, dark_mode) {
+        (SyntaxKind::Plain, true) => Color32::from_rgb(220, 224, 232),
+        (SyntaxKind::Plain, false) => Color32::from_rgb(34, 39, 46),
+        (SyntaxKind::Keyword, true) => Color32::from_rgb(255, 139, 148),
+        (SyntaxKind::Keyword, false) => Color32::from_rgb(190, 45, 60),
+        (SyntaxKind::Builtin, true) => Color32::from_rgb(130, 170, 255),
+        (SyntaxKind::Builtin, false) => Color32::from_rgb(30, 92, 190),
+        (SyntaxKind::Command, true) => Color32::from_rgb(105, 210, 170),
+        (SyntaxKind::Command, false) => Color32::from_rgb(20, 135, 95),
+        (SyntaxKind::String, true) => Color32::from_rgb(230, 190, 120),
+        (SyntaxKind::String, false) => Color32::from_rgb(145, 95, 20),
+        (SyntaxKind::Number, true) => Color32::from_rgb(190, 150, 255),
+        (SyntaxKind::Number, false) => Color32::from_rgb(115, 70, 175),
+        (SyntaxKind::Comment, true) => Color32::from_rgb(130, 140, 150),
+        (SyntaxKind::Comment, false) => Color32::from_rgb(105, 115, 125),
+    };
+    TextFormat {
+        font_id: FontId::monospace(15.0),
+        color,
+        ..Default::default()
+    }
+}
+
+fn string_end(line: &str, start: usize, quote: char) -> usize {
+    let mut escaped = false;
+    for (idx, ch) in line[start + quote.len_utf8()..].char_indices() {
+        let absolute = start + quote.len_utf8() + idx;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return absolute + ch.len_utf8();
+        }
+    }
+    line.len()
+}
+
+fn token_end(line: &str, start: usize, keep: impl Fn(char) -> bool) -> usize {
+    for (idx, ch) in line[start..].char_indices() {
+        if !keep(ch) {
+            return start + idx;
+        }
+    }
+    line.len()
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+const SCRIPT_KEYWORDS: &[&str] = &[
+    "def", "for", "in", "range", "while", "if", "elif", "else", "break", "continue", "goto",
+    "label", "true", "false", "True", "False",
+];
+
+const SCRIPT_BUILTINS: &[&str] = &["print", "str", "int", "float", "bool", "type"];
+
+const SCRIPT_COMMANDS: &[&str] = &[
+    "click",
+    "move",
+    "key",
+    "sleep",
+    "screenshot",
+    "find",
+    "find_click",
+    "点击坐标",
+    "移动鼠标",
+    "输入文本",
+    "等待",
+    "截图",
+    "查找图片",
+    "查找图片并点击",
+];
 
 fn send_run_log_snapshot(
     tx: &mpsc::Sender<AppEvent>,
