@@ -269,10 +269,14 @@ unsafe extern "system" fn script_edit_proc(
     if msg == WM_CHAR && wparam as u32 == VK_TAB as u32 {
         return 0;
     }
-    if matches!(msg, WM_CHAR | WM_KEYUP | WM_PASTE | WM_CUT | WM_UNDO) {
+    let result = CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam);
+    if matches!(
+        msg,
+        WM_CHAR | WM_KEYUP | WM_PASTE | WM_CUT | WM_UNDO | WM_VSCROLL | WM_MOUSEWHEEL
+    ) {
         PostMessageW(main_hwnd(), WM_APP + 2, 0, 0);
     }
-    CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam)
+    result
 }
 
 unsafe fn destroy_fonts() {
@@ -293,7 +297,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let capture_point_button = win7ui::create_button(hwnd, "捕获坐标", IDC_CAPTURE_POINT);
 
     let status = win7ui::create_label(hwnd, "就绪。编辑器 Tab 会插入 4 个空格。", 10, 44, 400, 22);
-    let line_numbers = win7ui::create_multiline_edit(hwnd, "1", 0, 10, 70, 48, 620, true, false);
+    let line_numbers = win7ui::create_line_number_gutter(hwnd, "1", 0, 10, 70, 48, 620);
     let script = win7ui::RichEdit::create(
         hwnd,
         SAMPLE_SCRIPT,
@@ -1089,7 +1093,8 @@ unsafe fn refresh_editor_view() {
         (to_hwnd(app.script), to_hwnd(app.line_numbers))
     };
     let text = win7ui::get_window_text(script);
-    update_line_numbers(line_numbers, &text);
+    let first_visible = win7ui::RichEdit::new(script).first_visible_line();
+    update_line_numbers(line_numbers, &text, first_visible);
     let spans = highlight_script_spans(&text);
     win7ui::RichEdit::new(script).apply_highlights(text.encode_utf16().count(), &spans, win7ui::rgb(32, 32, 32));
 }
@@ -1101,10 +1106,11 @@ unsafe fn focus_script_line(line: usize) {
     set_status(&format!("运行出错，已定位到第 {line} 行。"));
 }
 
-unsafe fn update_line_numbers(hwnd: HWND, text: &str) {
+unsafe fn update_line_numbers(hwnd: HWND, text: &str, first_visible: usize) {
     let count = text.lines().count().max(1);
+    let visible_count = 300usize.min(count.saturating_sub(first_visible).saturating_add(1));
     let mut numbers = String::new();
-    for line in 1..=count {
+    for line in first_visible..first_visible.saturating_add(visible_count) {
         numbers.push_str(&format!("{line:>4}\r\n"));
     }
     win7ui::replace_edit_text(hwnd, &numbers, false);

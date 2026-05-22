@@ -6,8 +6,8 @@ use windows_sys::Win32::{
     System::LibraryLoader::LoadLibraryW,
     UI::{
         Controls::{
-            EM_GETLINECOUNT, EM_LINEFROMCHAR, EM_LINEINDEX, EM_REPLACESEL, EM_SCROLLCARET,
-            EM_SETSEL,
+            EM_GETFIRSTVISIBLELINE, EM_GETLINECOUNT, EM_LINEFROMCHAR, EM_LINEINDEX,
+            EM_REPLACESEL, EM_SCROLLCARET, EM_SETSEL,
         },
         WindowsAndMessaging::{
             CreateWindowExW, SendMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
@@ -162,6 +162,10 @@ impl RichEdit {
         let pos = SendMessageW(self.hwnd, 0x00B0, 0, 0);
         let line = SendMessageW(self.hwnd, EM_LINEFROMCHAR, pos as usize, 0);
         line.max(0) as usize + 1
+    }
+
+    pub unsafe fn first_visible_line(self) -> usize {
+        SendMessageW(self.hwnd, EM_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize + 1
     }
 
     pub unsafe fn apply_highlights(self, text_len: usize, spans: &[HighlightSpan], default_color: u32) {

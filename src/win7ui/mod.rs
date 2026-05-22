@@ -12,8 +12,9 @@ pub mod text;
 pub mod window;
 
 pub use controls::{
-    create_button, create_button_at, create_label, create_multiline_edit, create_single_line_edit,
-    enable_window, hwnd_value, module_handle, to_hwnd, RawHwnd,
+    create_button, create_button_at, create_label, create_line_number_gutter,
+    create_multiline_edit, create_single_line_edit, enable_window, hwnd_value, module_handle,
+    to_hwnd, RawHwnd,
 };
 pub use dialogs::choose_file;
 pub use event::{event_channel, wake_window, UiEventSender};

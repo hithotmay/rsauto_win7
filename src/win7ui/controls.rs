@@ -7,8 +7,8 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::EnableWindow,
         WindowsAndMessaging::{
             CreateWindowExW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-            ES_NOHIDESEL, ES_READONLY, ES_WANTRETURN, WS_CHILD, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
-            WS_EX_CLIENTEDGE,
+            ES_NOHIDESEL, ES_READONLY, ES_RIGHT, ES_WANTRETURN, WS_CHILD, WS_HSCROLL, WS_VISIBLE,
+            WS_VSCROLL, WS_EX_CLIENTEDGE,
         },
     },
 };
@@ -94,6 +94,36 @@ pub unsafe fn create_multiline_edit(
         class.as_ptr(),
         wide(text).as_ptr(),
         style,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        id as _,
+        module_handle(),
+        std::ptr::null_mut(),
+    )
+}
+
+pub unsafe fn create_line_number_gutter(
+    parent: HWND,
+    text: &str,
+    id: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> HWND {
+    let class = wide("EDIT");
+    CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        class.as_ptr(),
+        wide(text).as_ptr(),
+        WS_CHILD
+            | WS_VISIBLE
+            | ES_MULTILINE as u32
+            | ES_READONLY as u32
+            | ES_RIGHT as u32,
         x,
         y,
         w,
