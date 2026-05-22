@@ -34,7 +34,7 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::EM_REPLACESEL,
-        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_TAB},
+        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_DELETE, VK_ESCAPE, VK_TAB},
         WindowsAndMessaging::*,
     },
 };
@@ -61,6 +61,7 @@ const IDC_CONFIRM_CANCEL: i32 = 307;
 const HOTKEY_RUN: i32 = 201;
 const HOTKEY_STOP: i32 = 202;
 const TIMER_LINE_GUTTER_SYNC: usize = 301;
+const TIMER_SCRIPT_HIGHLIGHT: usize = 302;
 const VK_F5: u32 = 0x74;
 const VK_F11: u32 = 0x7A;
 const MAX_LOG_CHARS: i32 = 80_000;
@@ -255,6 +256,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             refresh_line_numbers();
             0
         }
+        WM_TIMER if wparam == TIMER_SCRIPT_HIGHLIGHT => {
+            KillTimer(hwnd, TIMER_SCRIPT_HIGHLIGHT);
+            refresh_editor_view();
+            0
+        }
         msg if msg == WM_APP + 2 => {
             refresh_line_numbers();
             0
@@ -281,15 +287,17 @@ unsafe extern "system" fn script_edit_proc(
     if msg == WM_KEYDOWN && wparam as u32 == VK_TAB as u32 {
         let spaces = win7ui::wide("    ");
         SendMessageW(hwnd, EM_REPLACESEL, 1, spaces.as_ptr() as LPARAM);
-        PostMessageW(main_hwnd(), WM_APP + 3, 0, 0);
+        schedule_editor_highlight();
         return 0;
     }
     if msg == WM_CHAR && wparam as u32 == VK_TAB as u32 {
         return 0;
     }
     let result = CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam);
-    if matches!(msg, WM_CHAR | WM_PASTE | WM_CUT | WM_UNDO) {
-        PostMessageW(main_hwnd(), WM_APP + 3, 0, 0);
+    if matches!(msg, WM_CHAR | WM_IME_CHAR | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO) {
+        schedule_editor_highlight();
+    } else if msg == WM_KEYDOWN && wparam as u32 == VK_DELETE as u32 {
+        schedule_editor_highlight();
     } else if msg == WM_MOUSEWHEEL {
         schedule_line_number_refresh_after_wheel();
     } else if matches!(msg, WM_KEYUP | WM_VSCROLL) {
@@ -1283,6 +1291,12 @@ unsafe fn schedule_line_number_refresh_after_wheel() {
     SetTimer(hwnd, TIMER_LINE_GUTTER_SYNC, 45, None);
 }
 
+unsafe fn schedule_editor_highlight() {
+    let hwnd = main_hwnd();
+    PostMessageW(hwnd, WM_APP + 2, 0, 0);
+    SetTimer(hwnd, TIMER_SCRIPT_HIGHLIGHT, 90, None);
+}
+
 unsafe fn focus_script_line(line: usize) {
     let Some(app) = APP.get() else { return; };
     let script = to_hwnd(app.lock().unwrap().script);
@@ -1301,37 +1315,57 @@ fn highlight_script_spans(text: &str) -> Vec<win7ui::HighlightSpan> {
 }
 
 fn highlight_line_spans(line: &str, base: usize, spans: &mut Vec<win7ui::HighlightSpan>) {
-    let mut byte = 0usize;
-    let mut unit = 0usize;
-    while byte < line.len() {
-        let Some(ch) = line[byte..].chars().next() else { break; };
+    highlight_fragment_tokens(line, 0, 0, line.len(), base, spans, true);
+}
+
+fn highlight_fragment_tokens(
+    line: &str,
+    mut byte: usize,
+    mut unit: usize,
+    end_byte: usize,
+    base: usize,
+    spans: &mut Vec<win7ui::HighlightSpan>,
+    allow_comment: bool,
+) {
+    while byte < end_byte {
+        let Some(ch) = next_char(line, byte) else { break; };
         if ch == '#' {
-            push_span(spans, base + unit, base + line.encode_utf16().count(), win7ui::rgb(105, 120, 105));
-            break;
+            if allow_comment {
+                let (end_byte, end_unit) = token_end(line, byte, unit, end_byte, |c| c != '\r' && c != '\n');
+                push_span(spans, base + unit, base + end_unit, color_comment());
+                byte = end_byte;
+                unit = end_unit;
+                continue;
+            }
         }
-        if ch == '"' || ch == '\'' {
-            let (end_byte, end_unit) = string_token_end(line, byte, unit, ch);
-            push_span(spans, base + unit, base + end_unit, win7ui::rgb(145, 92, 25));
+        if let Some(start) = string_start(line, byte, unit, end_byte) {
+            let literal = string_literal_end(line, start.quote_byte, start.quote_unit, start.quote, end_byte);
+            push_span(spans, base + unit, base + literal.end_unit, color_string());
+            if start.is_f_string {
+                highlight_fstring_expressions(line, &literal, base, spans);
+            }
+            byte = literal.end_byte;
+            unit = literal.end_unit;
+            continue;
+        }
+        if starts_number(line, byte, end_byte) {
+            let (end_byte, end_unit) = number_token_end(line, byte, unit, end_byte);
+            push_span(spans, base + unit, base + end_unit, color_number());
             byte = end_byte;
             unit = end_unit;
             continue;
         }
-        if ch.is_ascii_digit() {
-            let (end_byte, end_unit) = token_end(line, byte, unit, |c| c.is_ascii_digit() || c == '.');
-            push_span(spans, base + unit, base + end_unit, win7ui::rgb(110, 70, 175));
-            byte = end_byte;
-            unit = end_unit;
-            continue;
-        }
-        if ch == '_' || ch.is_alphabetic() {
-            let (end_byte, end_unit) = token_end(line, byte, unit, |c| c == '_' || c.is_alphanumeric());
+        if is_ident_start(ch) {
+            let (end_byte, end_unit) = token_end(line, byte, unit, end_byte, is_ident_continue);
             let token = &line[byte..end_byte];
-            let color = if SCRIPT_KEYWORDS.contains(&token) {
-                Some(win7ui::rgb(175, 45, 60))
+            let color = if is_attribute_token(line, byte) {
+                None
+            } else if SCRIPT_KEYWORDS.contains(&token) {
+                Some(color_keyword())
             } else if SCRIPT_BUILTINS.contains(&token) {
-                Some(win7ui::rgb(25, 90, 185))
+                Some(color_builtin())
             } else if SCRIPT_COMMANDS.contains(&token) {
-                Some(win7ui::rgb(20, 135, 95))
+                Some(color_command())
             } else {
                 None
             };
@@ -1347,46 +1381,326 @@ fn highlight_line_spans(line: &str, base: usize, spans: &mut Vec<win7ui::Highlig
     }
 }
 
+fn highlight_fstring_expressions(
+    line: &str,
+    literal: &StringLiteral,
+    base: usize,
+    spans: &mut Vec<win7ui::HighlightSpan>,
+) {
+    let mut byte = literal.content_start_byte;
+    let mut unit = literal.content_start_unit;
+    while byte < literal.content_end_byte {
+        let Some(ch) = next_char(line, byte) else { break; };
+        if ch == '{' {
+            let (next_byte, next_unit) = advance_char(byte, unit, ch);
+            if next_char(line, next_byte) == Some('{') {
+                byte = next_byte + 1;
+                unit = next_unit + 1;
+                continue;
+            }
+            let expr_start_unit = unit;
+            let expr_inner_byte = next_byte;
+            let expr_inner_unit = next_unit;
+            byte = next_byte;
+            unit = next_unit;
+            let mut depth = 1usize;
+            while byte < literal.content_end_byte {
+                let Some(inner_ch) = next_char(line, byte) else { break; };
+                if let Some(start) = string_start(line, byte, unit, literal.content_end_byte) {
+                    let inner_literal =
+                        string_literal_end(line, start.quote_byte, start.quote_unit, start.quote, literal.content_end_byte);
+                    byte = inner_literal.end_byte;
+                    unit = inner_literal.end_unit;
+                    continue;
+                }
+                if inner_ch == '{' {
+                    let (next_byte, next_unit) = advance_char(byte, unit, inner_ch);
+                    if next_char(line, next_byte) == Some('{') {
+                        byte = next_byte + 1;
+                        unit = next_unit + 1;
+                    } else {
+                        depth += 1;
+                        byte = next_byte;
+                        unit = next_unit;
+                    }
+                    continue;
+                }
+                if inner_ch == '}' {
+                    let close_byte = byte;
+                    let (next_byte, next_unit) = advance_char(byte, unit, inner_ch);
+                    depth = depth.saturating_sub(1);
+                    byte = next_byte;
+                    unit = next_unit;
+                    if depth == 0 {
+                        push_span(spans, base + expr_start_unit, base + unit, color_default());
+                        highlight_fragment_tokens(
+                            line,
+                            expr_inner_byte,
+                            expr_inner_unit,
+                            close_byte,
+                            base,
+                            spans,
+                            false,
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                let (next_byte, next_unit) = advance_char(byte, unit, inner_ch);
+                byte = next_byte;
+                unit = next_unit;
+            }
+            continue;
+        }
+        if ch == '}' {
+            let (next_byte, next_unit) = advance_char(byte, unit, ch);
+            if next_char(line, next_byte) == Some('}') {
+                byte = next_byte + 1;
+                unit = next_unit + 1;
+                continue;
+            }
+        }
+        let (next_byte, next_unit) = advance_char(byte, unit, ch);
+        byte = next_byte;
+        unit = next_unit;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StringStart {
+    quote_byte: usize,
+    quote_unit: usize,
+    quote: char,
+    is_f_string: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StringLiteral {
+    end_byte: usize,
+    end_unit: usize,
+    content_start_byte: usize,
+    content_start_unit: usize,
+    content_end_byte: usize,
+}
+
+fn string_start(line: &str, byte: usize, unit: usize, end_byte: usize) -> Option<StringStart> {
+    let ch = next_char(line, byte)?;
+    if (ch == '"' || ch == '\'') && byte < end_byte {
+        return Some(StringStart {
+            quote_byte: byte,
+            quote_unit: unit,
+            quote: ch,
+            is_f_string: false,
+        });
+    }
+    if !ch.is_ascii_alphabetic() {
+        return None;
+    }
+    let (prefix_end_byte, prefix_end_unit) =
+        token_end(line, byte, unit, end_byte, |c| c.is_ascii_alphabetic());
+    let prefix = &line[byte..prefix_end_byte];
+    if !is_string_prefix(prefix) {
+        return None;
+    }
+    let quote = next_char(line, prefix_end_byte)?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    Some(StringStart {
+        quote_byte: prefix_end_byte,
+        quote_unit: prefix_end_unit,
+        quote,
+        is_f_string: prefix.chars().any(|c| c == 'f' || c == 'F'),
+    })
+}
+
+fn string_literal_end(line: &str, quote_byte: usize, quote_unit: usize, quote: char, end_byte: usize) -> StringLiteral {
+    let triple = line[quote_byte..].starts_with(&quote.to_string().repeat(3));
+    let quote_len = if triple { 3 } else { 1 };
+    let mut byte = quote_byte + quote_len;
+    let mut unit = quote_unit + quote_len;
+    let content_start_byte = byte;
+    let content_start_unit = unit;
+    let mut content_end_byte = byte;
+    let mut content_end_unit = unit;
+    let mut escaped = false;
+    while byte < end_byte {
+        let Some(ch) = next_char(line, byte) else { break; };
+        if ch == '\r' || ch == '\n' {
+            break;
+        }
+        if triple {
+            if line[byte..].starts_with(&quote.to_string().repeat(3)) {
+                return StringLiteral {
+                    end_byte: byte + 3,
+                    end_unit: unit + 3,
+                    content_start_byte,
+                    content_start_unit,
+                    content_end_byte: byte,
+                };
+            }
+        } else if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return StringLiteral {
+                end_byte: byte + ch.len_utf8(),
+                end_unit: unit + ch.len_utf16(),
+                content_start_byte,
+                content_start_unit,
+                content_end_byte,
+            };
+        }
+        let (next_byte, next_unit) = advance_char(byte, unit, ch);
+        byte = next_byte;
+        unit = next_unit;
+        content_end_byte = byte;
+        content_end_unit = unit;
+    }
+    StringLiteral {
+        end_byte: content_end_byte,
+        end_unit: content_end_unit,
+        content_start_byte,
+        content_start_unit,
+        content_end_byte,
+    }
+}
+
+fn is_string_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() || prefix.len() > 3 {
+        return false;
+    }
+    let mut has_f = false;
+    let mut has_r = false;
+    let mut has_b = false;
+    let mut has_u = false;
+    for ch in prefix.chars() {
+        match ch.to_ascii_lowercase() {
+            'f' if !has_f => has_f = true,
+            'r' if !has_r => has_r = true,
+            'b' if !has_b => has_b = true,
+            'u' if !has_u => has_u = true,
+            _ => return false,
+        }
+    }
+    !(has_f && has_b)
+}
+
+fn starts_number(line: &str, byte: usize, end_byte: usize) -> bool {
+    let Some(ch) = next_char(line, byte) else { return false; };
+    if ch.is_ascii_digit() {
+        return true;
+    }
+    ch == '.' && byte + 1 < end_byte && line[byte + 1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+fn number_token_end(line: &str, mut byte: usize, mut unit: usize, end_byte: usize) -> (usize, usize) {
+    let mut prev = '\0';
+    while byte < end_byte {
+        let Some(ch) = next_char(line, byte) else { break; };
+        let keep = ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || ch == '.'
+            || ((ch == '+' || ch == '-') && (prev == 'e' || prev == 'E'));
+        if !keep {
+            break;
+        }
+        let (next_byte, next_unit) = advance_char(byte, unit, ch);
+        byte = next_byte;
+        unit = next_unit;
+        prev = ch;
+    }
+    (byte, unit)
+}
+
 fn push_span(spans: &mut Vec<win7ui::HighlightSpan>, start: usize, end: usize, color: u32) {
     if end > start {
         spans.push(win7ui::HighlightSpan { start, end, color });
     }
 }
 
-fn token_end(line: &str, mut byte: usize, mut unit: usize, keep: impl Fn(char) -> bool) -> (usize, usize) {
-    while byte < line.len() {
-        let ch = line[byte..].chars().next().unwrap();
+fn token_end(
+    line: &str,
+    mut byte: usize,
+    mut unit: usize,
+    end_byte: usize,
+    keep: impl Fn(char) -> bool,
+) -> (usize, usize) {
+    while byte < end_byte {
+        let Some(ch) = next_char(line, byte) else { break; };
         if !keep(ch) {
             break;
         }
-        byte += ch.len_utf8();
-        unit += ch.len_utf16();
+        let (next_byte, next_unit) = advance_char(byte, unit, ch);
+        byte = next_byte;
+        unit = next_unit;
     }
     (byte, unit)
 }
 
-fn string_token_end(line: &str, mut byte: usize, mut unit: usize, quote: char) -> (usize, usize) {
-    let mut escaped = false;
-    while byte < line.len() {
-        let ch = line[byte..].chars().next().unwrap();
-        byte += ch.len_utf8();
-        unit += ch.len_utf16();
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == quote {
-            break;
-        }
-    }
-    (byte, unit)
+fn next_char(text: &str, byte: usize) -> Option<char> {
+    text.get(byte..)?.chars().next()
+}
+
+fn advance_char(byte: usize, unit: usize, ch: char) -> (usize, usize) {
+    (byte + ch.len_utf8(), unit + ch.len_utf16())
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn is_attribute_token(line: &str, byte: usize) -> bool {
+    line[..byte]
+        .chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| ch == '.')
+}
+
+fn color_default() -> u32 {
+    win7ui::rgb(32, 32, 32)
+}
+
+fn color_comment() -> u32 {
+    win7ui::rgb(105, 120, 105)
+}
+
+fn color_string() -> u32 {
+    win7ui::rgb(145, 92, 25)
+}
+
+fn color_number() -> u32 {
+    win7ui::rgb(110, 70, 175)
+}
+
+fn color_keyword() -> u32 {
+    win7ui::rgb(175, 45, 60)
+}
+
+fn color_builtin() -> u32 {
+    win7ui::rgb(25, 90, 185)
+}
+
+fn color_command() -> u32 {
+    win7ui::rgb(20, 135, 95)
 }
 
 const SCRIPT_KEYWORDS: &[&str] = &[
-    "def", "for", "in", "range", "while", "if", "elif", "else", "break", "continue", "goto",
-    "label", "true", "false", "True", "False",
+    "and", "as", "assert", "break", "class", "continue", "def", "del", "elif", "else", "except",
+    "finally", "for", "from", "global", "goto", "if", "import", "in", "is", "label", "lambda",
+    "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield", "None",
+    "True", "False", "true", "false",
 ];
-const SCRIPT_BUILTINS: &[&str] = &["print", "str", "int", "float", "bool", "type"];
+const SCRIPT_BUILTINS: &[&str] = &[
+    "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "len", "list", "max", "min",
+    "print", "range", "set", "str", "sum", "tuple", "type",
+];
 const SCRIPT_COMMANDS: &[&str] = &[
     "click",
     "move",
