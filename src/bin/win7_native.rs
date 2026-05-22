@@ -25,9 +25,10 @@ use screenshots::Screen;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW, InvalidateRect,
-        SelectObject, SetBkMode, SetTextAlign, SetTextColor, TextOutW, UpdateWindow, COLOR_WINDOW,
-        PAINTSTRUCT, TA_RIGHT, TA_TOP, TEXTMETRICW, TRANSPARENT,
+        BeginPaint, EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW, RedrawWindow,
+        SelectClipRgn, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TextOutW, UpdateWindow,
+        COLOR_WINDOW, HDC, PAINTSTRUCT, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW,
+        TA_RIGHT, TA_TOP, TEXTMETRICW, TRANSPARENT,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -385,6 +386,10 @@ unsafe extern "system" fn line_number_gutter_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ERASEBKGND => {
+            erase_line_number_gutter(hwnd, wparam as HDC);
+            1
+        }
         WM_PAINT => {
             paint_line_number_gutter(hwnd);
             0
@@ -408,10 +413,28 @@ unsafe fn subclass_line_number_gutter(hwnd: HWND) {
 unsafe fn paint_line_number_gutter(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
+    SelectClipRgn(hdc, null_mut());
+    draw_line_number_gutter(hwnd, hdc);
+    EndPaint(hwnd, &ps);
+}
 
+unsafe fn erase_line_number_gutter(hwnd: HWND, hdc: HDC) {
+    if hdc.is_null() {
+        return;
+    }
     let mut rect = std::mem::zeroed();
     GetClientRect(hwnd, &mut rect);
     FillRect(hdc, &rect, GetSysColorBrush(COLOR_WINDOW));
+}
+
+unsafe fn draw_line_number_gutter(hwnd: HWND, hdc: HDC) {
+    if hdc.is_null() {
+        return;
+    }
+
+    erase_line_number_gutter(hwnd, hdc);
+    let mut rect = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
 
     let (script, font) = if let Some(app) = APP.get() {
         let app = app.lock().unwrap();
@@ -460,8 +483,6 @@ unsafe fn paint_line_number_gutter(hwnd: HWND) {
             SelectObject(hdc, old_font);
         }
     }
-
-    EndPaint(hwnd, &ps);
 }
 
 unsafe fn layout_controls(hwnd: HWND) {
@@ -1194,8 +1215,12 @@ unsafe fn refresh_editor_view() {
 unsafe fn refresh_line_numbers() {
     let Some(app) = APP.get() else { return; };
     let line_numbers = to_hwnd(app.lock().unwrap().line_numbers);
-    InvalidateRect(line_numbers, null_mut(), 1);
-    UpdateWindow(line_numbers);
+    RedrawWindow(
+        line_numbers,
+        null_mut(),
+        null_mut(),
+        RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_NOCHILDREN,
+    );
 }
 
 unsafe fn focus_script_line(line: usize) {
