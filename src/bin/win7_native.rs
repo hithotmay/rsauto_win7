@@ -89,6 +89,7 @@ print(f'你好，x = {x}')
 struct AppState {
     hwnd: isize,
     script: isize,
+    line_numbers: isize,
     log: isize,
     status: isize,
     run_button: isize,
@@ -158,7 +159,10 @@ enum AppEvent {
         lines: Vec<String>,
         total_lines: usize,
     },
-    Done { status: String },
+    Done {
+        status: String,
+        error_line: Option<usize>,
+    },
     CaptureReady {
         mode: CaptureMode,
         result: Result<CapturedScreen, String>,
@@ -238,6 +242,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             drain_events();
             0
         }
+        msg if msg == WM_APP + 2 => {
+            refresh_editor_view();
+            0
+        }
         WM_DESTROY => {
             destroy_fonts();
             PostQuitMessage(0);
@@ -261,6 +269,9 @@ unsafe extern "system" fn script_edit_proc(
     if msg == WM_CHAR && wparam as u32 == VK_TAB as u32 {
         return 0;
     }
+    if matches!(msg, WM_CHAR | WM_KEYUP | WM_PASTE | WM_CUT | WM_UNDO) {
+        PostMessageW(main_hwnd(), WM_APP + 2, 0, 0);
+    }
     CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam)
 }
 
@@ -282,17 +293,17 @@ unsafe fn create_controls(hwnd: HWND) {
     let capture_point_button = win7ui::create_button(hwnd, "捕获坐标", IDC_CAPTURE_POINT);
 
     let status = win7ui::create_label(hwnd, "就绪。编辑器 Tab 会插入 4 个空格。", 10, 44, 400, 22);
-    let script = win7ui::create_multiline_edit(
+    let line_numbers = win7ui::create_multiline_edit(hwnd, "1", 0, 10, 70, 48, 620, true, false);
+    let script = win7ui::RichEdit::create(
         hwnd,
         SAMPLE_SCRIPT,
         IDC_SCRIPT,
-        10,
+        62,
         70,
-        650,
+        598,
         620,
-        false,
-        true,
-    );
+    )
+    .hwnd();
     let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
     let fonts = win7ui::UiFonts::win7_defaults();
     win7ui::apply_font_handle(status, fonts.ui);
@@ -306,6 +317,7 @@ unsafe fn create_controls(hwnd: HWND) {
         click_image_button,
         capture_point_button,
     ], fonts.ui);
+    win7ui::apply_font_handle(line_numbers, fonts.log);
     win7ui::apply_font_handle(script, fonts.editor);
     win7ui::apply_font_handle(log, fonts.log);
     subclass_script_editor(script);
@@ -314,6 +326,7 @@ unsafe fn create_controls(hwnd: HWND) {
         let mut app = app.lock().unwrap();
         app.hwnd = hwnd_value(hwnd);
         app.script = hwnd_value(script);
+        app.line_numbers = hwnd_value(line_numbers);
         app.log = hwnd_value(log);
         app.status = hwnd_value(status);
         app.run_button = hwnd_value(run_button);
@@ -329,6 +342,7 @@ unsafe fn create_controls(hwnd: HWND) {
 
     update_running_ui(false);
     layout_controls(hwnd);
+    refresh_editor_view();
 }
 
 unsafe fn current_ui_font() -> HWND {
@@ -378,7 +392,14 @@ unsafe fn layout_controls(hwnd: HWND) {
         win7ui::move_window(to_hwnd(app.status), 10, 44, width - 20, 22);
 
         let split = win7ui::split_left_right(width, height, 10, 70, 10, 410, 250);
-        win7ui::move_window(to_hwnd(app.script), split.left_x, split.y, split.left_w, split.h);
+        win7ui::move_window(to_hwnd(app.line_numbers), split.left_x, split.y, 48, split.h);
+        win7ui::move_window(
+            to_hwnd(app.script),
+            split.left_x + 52,
+            split.y,
+            split.left_w - 52,
+            split.h,
+        );
         win7ui::move_window(to_hwnd(app.log), split.right_x, split.y, split.right_w, split.h);
     }
 }
@@ -423,6 +444,7 @@ unsafe fn start_script() {
             })?;
             Ok(())
         });
+        let error_line = result.as_ref().err().and_then(run_error_line);
         let (final_line, status) = match result {
             Ok(()) => ("运行完成。".to_string(), "运行完成。"),
             Err(RunError::Stopped) => ("运行已停止。".to_string(), "运行已停止。"),
@@ -432,6 +454,7 @@ unsafe fn start_script() {
         send_log_snapshot(&tx, &tail_logs, total_lines);
         let _ = tx.send(AppEvent::Done {
             status: status.to_string(),
+            error_line,
         });
         unsafe { tx.wake(); }
     });
@@ -472,15 +495,23 @@ fn push_tail_log(tail_logs: &mut VecDeque<String>, total_lines: &mut usize, line
     tail_logs.push_back(line);
 }
 
+fn run_error_line(err: &RunError) -> Option<usize> {
+    match err {
+        RunError::Line { line, .. } => Some(*line),
+        _ => None,
+    }
+}
+
 unsafe fn open_script() {
     let Some(path) = choose_script_file(false) else { return; };
     match fs::read_to_string(&path) {
         Ok(text) => {
             if let Some(app) = APP.get() {
                 let mut app = app.lock().unwrap();
-                win7ui::set_window_text(to_hwnd(app.script), &text);
+                win7ui::RichEdit::new(to_hwnd(app.script)).set_text(&text);
                 app.current_file = Some(path.clone());
             }
+            refresh_editor_view();
             append_log(&format!("已打开脚本：{}", path.display()));
             set_status(&format!("当前脚本：{}", path.display()));
         }
@@ -1048,7 +1079,149 @@ unsafe fn insert_script_line(line: &str) {
     let Some(app) = APP.get() else { return; };
     let script = to_hwnd(app.lock().unwrap().script);
     win7ui::insert_line_at_end(script, line);
+    refresh_editor_view();
 }
+
+unsafe fn refresh_editor_view() {
+    let Some(app) = APP.get() else { return; };
+    let (script, line_numbers) = {
+        let app = app.lock().unwrap();
+        (to_hwnd(app.script), to_hwnd(app.line_numbers))
+    };
+    let text = win7ui::get_window_text(script);
+    update_line_numbers(line_numbers, &text);
+    let spans = highlight_script_spans(&text);
+    win7ui::RichEdit::new(script).apply_highlights(text.encode_utf16().count(), &spans, win7ui::rgb(32, 32, 32));
+}
+
+unsafe fn focus_script_line(line: usize) {
+    let Some(app) = APP.get() else { return; };
+    let script = to_hwnd(app.lock().unwrap().script);
+    win7ui::RichEdit::new(script).focus_line(line);
+    set_status(&format!("运行出错，已定位到第 {line} 行。"));
+}
+
+unsafe fn update_line_numbers(hwnd: HWND, text: &str) {
+    let count = text.lines().count().max(1);
+    let mut numbers = String::new();
+    for line in 1..=count {
+        numbers.push_str(&format!("{line:>4}\r\n"));
+    }
+    win7ui::replace_edit_text(hwnd, &numbers, false);
+}
+
+fn highlight_script_spans(text: &str) -> Vec<win7ui::HighlightSpan> {
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    for line in text.split_inclusive('\n') {
+        highlight_line_spans(line, pos, &mut spans);
+        pos += line.encode_utf16().count();
+    }
+    spans
+}
+
+fn highlight_line_spans(line: &str, base: usize, spans: &mut Vec<win7ui::HighlightSpan>) {
+    let mut byte = 0usize;
+    let mut unit = 0usize;
+    while byte < line.len() {
+        let Some(ch) = line[byte..].chars().next() else { break; };
+        if ch == '#' {
+            push_span(spans, base + unit, base + line.encode_utf16().count(), win7ui::rgb(105, 120, 105));
+            break;
+        }
+        if ch == '"' || ch == '\'' {
+            let (end_byte, end_unit) = string_token_end(line, byte, unit, ch);
+            push_span(spans, base + unit, base + end_unit, win7ui::rgb(145, 92, 25));
+            byte = end_byte;
+            unit = end_unit;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            let (end_byte, end_unit) = token_end(line, byte, unit, |c| c.is_ascii_digit() || c == '.');
+            push_span(spans, base + unit, base + end_unit, win7ui::rgb(110, 70, 175));
+            byte = end_byte;
+            unit = end_unit;
+            continue;
+        }
+        if ch == '_' || ch.is_alphabetic() {
+            let (end_byte, end_unit) = token_end(line, byte, unit, |c| c == '_' || c.is_alphanumeric());
+            let token = &line[byte..end_byte];
+            let color = if SCRIPT_KEYWORDS.contains(&token) {
+                Some(win7ui::rgb(175, 45, 60))
+            } else if SCRIPT_BUILTINS.contains(&token) {
+                Some(win7ui::rgb(25, 90, 185))
+            } else if SCRIPT_COMMANDS.contains(&token) {
+                Some(win7ui::rgb(20, 135, 95))
+            } else {
+                None
+            };
+            if let Some(color) = color {
+                push_span(spans, base + unit, base + end_unit, color);
+            }
+            byte = end_byte;
+            unit = end_unit;
+            continue;
+        }
+        byte += ch.len_utf8();
+        unit += ch.len_utf16();
+    }
+}
+
+fn push_span(spans: &mut Vec<win7ui::HighlightSpan>, start: usize, end: usize, color: u32) {
+    if end > start {
+        spans.push(win7ui::HighlightSpan { start, end, color });
+    }
+}
+
+fn token_end(line: &str, mut byte: usize, mut unit: usize, keep: impl Fn(char) -> bool) -> (usize, usize) {
+    while byte < line.len() {
+        let ch = line[byte..].chars().next().unwrap();
+        if !keep(ch) {
+            break;
+        }
+        byte += ch.len_utf8();
+        unit += ch.len_utf16();
+    }
+    (byte, unit)
+}
+
+fn string_token_end(line: &str, mut byte: usize, mut unit: usize, quote: char) -> (usize, usize) {
+    let mut escaped = false;
+    while byte < line.len() {
+        let ch = line[byte..].chars().next().unwrap();
+        byte += ch.len_utf8();
+        unit += ch.len_utf16();
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            break;
+        }
+    }
+    (byte, unit)
+}
+
+const SCRIPT_KEYWORDS: &[&str] = &[
+    "def", "for", "in", "range", "while", "if", "elif", "else", "break", "continue", "goto",
+    "label", "true", "false", "True", "False",
+];
+const SCRIPT_BUILTINS: &[&str] = &["print", "str", "int", "float", "bool", "type"];
+const SCRIPT_COMMANDS: &[&str] = &[
+    "click",
+    "move",
+    "sleep",
+    "screenshot",
+    "find",
+    "find_click",
+    "点击坐标",
+    "移动鼠标",
+    "输入文本",
+    "等待",
+    "截图",
+    "查找图片",
+    "查找图片并点击",
+];
 
 unsafe fn drain_events() {
     let rx = {
@@ -1064,7 +1237,7 @@ unsafe fn drain_events() {
         processed += 1;
         match event {
             AppEvent::ReplaceLog { lines, total_lines } => replace_log_snapshot(&lines, total_lines),
-            AppEvent::Done { status } => {
+            AppEvent::Done { status, error_line } => {
                 keep = false;
                 if let Some(app) = APP.get() {
                     let mut app = app.lock().unwrap();
@@ -1073,6 +1246,9 @@ unsafe fn drain_events() {
                 }
                 update_running_ui(false);
                 set_status(&status);
+                if let Some(line) = error_line {
+                    focus_script_line(line);
+                }
             }
             AppEvent::CaptureReady { mode, result } => {
                 keep = false;

@@ -7,6 +7,7 @@ pub mod hotkey;
 pub mod layout;
 pub mod log_view;
 pub mod overlay;
+pub mod rich_edit;
 pub mod text;
 pub mod window;
 
@@ -24,6 +25,7 @@ pub use hotkey::HotKey;
 pub use layout::{move_window, row_layout, split_left_right};
 pub use log_view::LogView;
 pub use overlay::{client_selection_rect, lparam_pos, paint_selection_overlay, rgb, SelectionRect};
+pub use rich_edit::{show_line_number_gutter, HighlightSpan, RichEdit};
 pub use text::{
     append_edit_text, get_window_text, insert_line_at_end, replace_edit_text, script_path_literal,
     set_window_text, wide,

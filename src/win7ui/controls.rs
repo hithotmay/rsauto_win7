@@ -7,7 +7,7 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::EnableWindow,
         WindowsAndMessaging::{
             CreateWindowExW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-            ES_READONLY, ES_WANTRETURN, WS_CHILD, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
+            ES_NOHIDESEL, ES_READONLY, ES_WANTRETURN, WS_CHILD, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
             WS_EX_CLIENTEDGE,
         },
     },
@@ -80,7 +80,8 @@ pub unsafe fn create_multiline_edit(
         | WS_VSCROLL
         | ES_MULTILINE as u32
         | ES_AUTOVSCROLL as u32
-        | ES_WANTRETURN as u32;
+        | ES_WANTRETURN as u32
+        | ES_NOHIDESEL as u32;
     if readonly {
         style |= ES_READONLY as u32;
     }
