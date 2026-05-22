@@ -243,6 +243,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         msg if msg == WM_APP + 2 => {
+            refresh_line_numbers();
+            0
+        }
+        msg if msg == WM_APP + 3 => {
             refresh_editor_view();
             0
         }
@@ -264,16 +268,16 @@ unsafe extern "system" fn script_edit_proc(
     if msg == WM_KEYDOWN && wparam as u32 == VK_TAB as u32 {
         let spaces = win7ui::wide("    ");
         SendMessageW(hwnd, EM_REPLACESEL, 1, spaces.as_ptr() as LPARAM);
+        PostMessageW(main_hwnd(), WM_APP + 3, 0, 0);
         return 0;
     }
     if msg == WM_CHAR && wparam as u32 == VK_TAB as u32 {
         return 0;
     }
     let result = CallWindowProcW(SCRIPT_EDIT_PROC, hwnd, msg, wparam, lparam);
-    if matches!(
-        msg,
-        WM_CHAR | WM_KEYUP | WM_PASTE | WM_CUT | WM_UNDO | WM_VSCROLL | WM_MOUSEWHEEL
-    ) {
+    if matches!(msg, WM_CHAR | WM_PASTE | WM_CUT | WM_UNDO) {
+        PostMessageW(main_hwnd(), WM_APP + 3, 0, 0);
+    } else if matches!(msg, WM_KEYUP | WM_VSCROLL | WM_MOUSEWHEEL) {
         PostMessageW(main_hwnd(), WM_APP + 2, 0, 0);
     }
     result
@@ -321,7 +325,7 @@ unsafe fn create_controls(hwnd: HWND) {
         click_image_button,
         capture_point_button,
     ], fonts.ui);
-    win7ui::apply_font_handle(line_numbers, fonts.log);
+    win7ui::apply_font_handle(line_numbers, fonts.editor);
     win7ui::apply_font_handle(script, fonts.editor);
     win7ui::apply_font_handle(log, fonts.log);
     subclass_script_editor(script);
@@ -1088,15 +1092,25 @@ unsafe fn insert_script_line(line: &str) {
 
 unsafe fn refresh_editor_view() {
     let Some(app) = APP.get() else { return; };
-    let (script, line_numbers) = {
-        let app = app.lock().unwrap();
-        (to_hwnd(app.script), to_hwnd(app.line_numbers))
-    };
+    let script = to_hwnd(app.lock().unwrap().script);
     let text = win7ui::get_window_text(script);
-    let first_visible = win7ui::RichEdit::new(script).first_visible_line();
-    update_line_numbers(line_numbers, &text, first_visible);
+    refresh_line_numbers_with_text(script, &text);
     let spans = highlight_script_spans(&text);
     win7ui::RichEdit::new(script).apply_highlights(text.encode_utf16().count(), &spans, win7ui::rgb(32, 32, 32));
+}
+
+unsafe fn refresh_line_numbers() {
+    let Some(app) = APP.get() else { return; };
+    let script = to_hwnd(app.lock().unwrap().script);
+    let text = win7ui::get_window_text(script);
+    refresh_line_numbers_with_text(script, &text);
+}
+
+unsafe fn refresh_line_numbers_with_text(script: HWND, text: &str) {
+    let Some(app) = APP.get() else { return; };
+    let line_numbers = to_hwnd(app.lock().unwrap().line_numbers);
+    let first_visible = win7ui::RichEdit::new(script).first_visible_line();
+    update_line_numbers(line_numbers, text, first_visible);
 }
 
 unsafe fn focus_script_line(line: usize) {
@@ -1107,11 +1121,11 @@ unsafe fn focus_script_line(line: usize) {
 }
 
 unsafe fn update_line_numbers(hwnd: HWND, text: &str, first_visible: usize) {
-    let count = text.lines().count().max(1);
+    let count = text.split('\n').count().max(1);
     let visible_count = 300usize.min(count.saturating_sub(first_visible).saturating_add(1));
     let mut numbers = String::new();
     for line in first_visible..first_visible.saturating_add(visible_count) {
-        numbers.push_str(&format!("{line:>4}\r\n"));
+        numbers.push_str(&format!("{:>4}\r\n", line.saturating_add(1)));
     }
     win7ui::replace_edit_text(hwnd, &numbers, false);
 }
