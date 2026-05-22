@@ -248,6 +248,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             refresh_editor_view();
             0
         }
+        msg if msg == win7ui::CODE_EDITOR_REFRESH_MARKS => {
+            refresh_editor_marks();
+            0
+        }
         WM_DESTROY => {
             destroy_fonts();
             PostQuitMessage(0);
@@ -361,6 +365,7 @@ unsafe fn start_script() {
             append_log("脚本已经在运行，忽略重复运行请求。");
             return;
         }
+        app.editor.clear_error_line();
         let script = app.editor.text();
         let (tx, rx) = win7ui::event_channel(to_hwnd(app.hwnd), WM_APP);
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -1040,6 +1045,11 @@ unsafe fn refresh_line_numbers() {
     app.lock().unwrap().editor.refresh_gutter();
 }
 
+unsafe fn refresh_editor_marks() {
+    let Some(app) = APP.get() else { return; };
+    app.lock().unwrap().editor.refresh_marks();
+}
+
 unsafe fn handle_editor_timer(timer_id: WPARAM) -> bool {
     APP.get()
         .map(|app| app.lock().unwrap().editor.handle_timer(timer_id))
@@ -1048,7 +1058,9 @@ unsafe fn handle_editor_timer(timer_id: WPARAM) -> bool {
 
 unsafe fn focus_script_line(line: usize) {
     let Some(app) = APP.get() else { return; };
-    app.lock().unwrap().editor.focus_line(line);
+    let editor = app.lock().unwrap().editor;
+    editor.mark_error_line(line);
+    editor.focus_line(line);
     set_status(&format!("运行出错，已定位到第 {line} 行。"));
 }
 

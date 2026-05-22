@@ -13,7 +13,9 @@ pub mod text;
 pub mod window;
 
 pub use app::{AppShell, AppShellStart, AppStore};
-pub use code_editor::{CodeEditor, CODE_EDITOR_REFRESH_ALL, CODE_EDITOR_REFRESH_GUTTER};
+pub use code_editor::{
+    CodeEditor, CODE_EDITOR_REFRESH_ALL, CODE_EDITOR_REFRESH_GUTTER, CODE_EDITOR_REFRESH_MARKS,
+};
 pub use controls::{
     create_button, create_button_at, create_label, create_line_number_gutter,
     create_multiline_edit, create_single_line_edit, enable_window, hwnd_value, module_handle,

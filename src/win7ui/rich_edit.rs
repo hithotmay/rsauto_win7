@@ -26,6 +26,8 @@ const EM_POSFROMCHAR_RICH: u32 = 0x0400 + 38;
 const EM_LINESCROLL: u32 = 0x00B6;
 const SCF_SELECTION: WPARAM = 0x0001;
 const CFM_COLOR: u32 = 0x40000000;
+const CFM_BACKCOLOR: u32 = 0x04000000;
+const CFE_AUTOBACKCOLOR: u32 = 0x04000000;
 
 #[repr(C)]
 struct CharRange {
@@ -50,6 +52,30 @@ struct CharFormatW {
     b_char_set: u8,
     b_pitch_and_family: u8,
     sz_face_name: [u16; 32],
+}
+
+#[repr(C)]
+struct CharFormat2W {
+    cb_size: u32,
+    dw_mask: u32,
+    dw_effects: u32,
+    y_height: i32,
+    y_offset: i32,
+    cr_text_color: u32,
+    b_char_set: u8,
+    b_pitch_and_family: u8,
+    sz_face_name: [u16; 32],
+    w_weight: u16,
+    s_spacing: i16,
+    cr_back_color: u32,
+    lcid: u32,
+    dw_reserved: u32,
+    s_style: i16,
+    w_kerning: u16,
+    b_underline_type: u8,
+    b_animation: u8,
+    b_rev_author: u8,
+    b_underline_color: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -172,6 +198,22 @@ impl RichEdit {
         line.max(0) as usize + 1
     }
 
+    pub unsafe fn line_range(self, line: usize, text_len: usize) -> Option<(usize, usize)> {
+        let line = line.checked_sub(1)?;
+        let start = SendMessageW(self.hwnd, EM_LINEINDEX, line, 0);
+        if start < 0 {
+            return None;
+        }
+        let next = SendMessageW(self.hwnd, EM_LINEINDEX, line + 1, 0);
+        let end = if next >= 0 {
+            next as usize
+        } else {
+            text_len
+        };
+        let start = start as usize;
+        (end > start).then_some((start, end.min(text_len)))
+    }
+
     pub unsafe fn first_visible_line(self) -> usize {
         SendMessageW(self.hwnd, EM_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize
     }
@@ -230,6 +272,53 @@ impl RichEdit {
         InvalidateRect(self.hwnd, null_mut(), 1);
     }
 
+    pub unsafe fn apply_line_markers(
+        self,
+        text_len: usize,
+        current_line: Option<usize>,
+        error_line: Option<usize>,
+        current_color: u32,
+        error_color: u32,
+    ) {
+        if self.hwnd.is_null() {
+            return;
+        }
+        let first_visible = self.first_visible_line();
+        let mut original = CharRange {
+            cp_min: 0,
+            cp_max: 0,
+        };
+        SendMessageW(
+            self.hwnd,
+            EM_EXGETSEL,
+            0,
+            &mut original as *mut CharRange as LPARAM,
+        );
+        SendMessageW(self.hwnd, WM_SETREDRAW, 0, 0);
+        self.apply_auto_back_color(0, text_len);
+        if let Some(line) = current_line {
+            if Some(line) != error_line {
+                if let Some((start, end)) = self.line_range(line, text_len) {
+                    self.apply_back_color(start, end, current_color);
+                }
+            }
+        }
+        if let Some(line) = error_line {
+            if let Some((start, end)) = self.line_range(line, text_len) {
+                self.apply_back_color(start, end, error_color);
+            }
+        }
+        SendMessageW(
+            self.hwnd,
+            EM_EXSETSEL,
+            0,
+            &mut original as *mut CharRange as LPARAM,
+        );
+        self.scroll_to_first_visible_line(first_visible);
+        SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
+        InvalidateRect(self.hwnd, null_mut(), 1);
+    }
+
     unsafe fn apply_color(self, start: usize, end: usize, color: u32) {
         if end <= start {
             return;
@@ -260,6 +349,94 @@ impl RichEdit {
             EM_SETCHARFORMAT,
             SCF_SELECTION,
             &mut format as *mut CharFormatW as LPARAM,
+        );
+    }
+
+    unsafe fn apply_back_color(self, start: usize, end: usize, color: u32) {
+        if end <= start {
+            return;
+        }
+        let mut range = CharRange {
+            cp_min: start as i32,
+            cp_max: end as i32,
+        };
+        SendMessageW(
+            self.hwnd,
+            EM_EXSETSEL,
+            0,
+            &mut range as *mut CharRange as LPARAM,
+        );
+        let mut format = CharFormat2W {
+            cb_size: std::mem::size_of::<CharFormat2W>() as u32,
+            dw_mask: CFM_BACKCOLOR,
+            dw_effects: 0,
+            y_height: 0,
+            y_offset: 0,
+            cr_text_color: 0,
+            b_char_set: 0,
+            b_pitch_and_family: 0,
+            sz_face_name: [0; 32],
+            w_weight: 0,
+            s_spacing: 0,
+            cr_back_color: color,
+            lcid: 0,
+            dw_reserved: 0,
+            s_style: 0,
+            w_kerning: 0,
+            b_underline_type: 0,
+            b_animation: 0,
+            b_rev_author: 0,
+            b_underline_color: 0,
+        };
+        SendMessageW(
+            self.hwnd,
+            EM_SETCHARFORMAT,
+            SCF_SELECTION,
+            &mut format as *mut CharFormat2W as LPARAM,
+        );
+    }
+
+    unsafe fn apply_auto_back_color(self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let mut range = CharRange {
+            cp_min: start as i32,
+            cp_max: end as i32,
+        };
+        SendMessageW(
+            self.hwnd,
+            EM_EXSETSEL,
+            0,
+            &mut range as *mut CharRange as LPARAM,
+        );
+        let mut format = CharFormat2W {
+            cb_size: std::mem::size_of::<CharFormat2W>() as u32,
+            dw_mask: CFM_BACKCOLOR,
+            dw_effects: CFE_AUTOBACKCOLOR,
+            y_height: 0,
+            y_offset: 0,
+            cr_text_color: 0,
+            b_char_set: 0,
+            b_pitch_and_family: 0,
+            sz_face_name: [0; 32],
+            w_weight: 0,
+            s_spacing: 0,
+            cr_back_color: 0,
+            lcid: 0,
+            dw_reserved: 0,
+            s_style: 0,
+            w_kerning: 0,
+            b_underline_type: 0,
+            b_animation: 0,
+            b_rev_author: 0,
+            b_underline_color: 0,
+        };
+        SendMessageW(
+            self.hwnd,
+            EM_SETCHARFORMAT,
+            SCF_SELECTION,
+            &mut format as *mut CharFormat2W as LPARAM,
         );
     }
 }

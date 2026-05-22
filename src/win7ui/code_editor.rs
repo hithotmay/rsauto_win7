@@ -1,13 +1,14 @@
 use std::ptr::null_mut;
 
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-        EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW, RedrawWindow, SelectClipRgn,
-        SelectObject, SetBkMode, SetTextAlign, SetTextColor, TextOutW, UpdateWindow, COLOR_WINDOW,
-        HDC, PAINTSTRUCT, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY,
-        TA_RIGHT, TA_TOP, TEXTMETRICW, TRANSPARENT,
+        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
+        DeleteDC, DeleteObject, EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW,
+        RedrawWindow, SelectClipRgn, SelectObject, SetBkMode, SetTextAlign, SetTextColor,
+        TextOutW, UpdateWindow, COLOR_WINDOW, HBRUSH, HDC, PAINTSTRUCT, RDW_ERASE,
+        RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY, TA_RIGHT, TA_TOP, TEXTMETRICW,
+        TRANSPARENT,
     },
     UI::{
         Controls::EM_REPLACESEL,
@@ -23,11 +24,14 @@ use super::{
 
 pub const CODE_EDITOR_REFRESH_GUTTER: u32 = WM_APP + 20;
 pub const CODE_EDITOR_REFRESH_ALL: u32 = WM_APP + 21;
+pub const CODE_EDITOR_REFRESH_MARKS: u32 = WM_APP + 22;
 
 const GUTTER_TIMER_BASE: usize = 20_000;
 const HIGHLIGHT_TIMER_BASE: usize = 30_000;
+const MARK_TIMER_BASE: usize = 40_000;
 const GUTTER_WHEEL_SYNC_MS: u32 = 45;
 const HIGHLIGHT_SYNC_MS: u32 = 90;
+const MARK_SYNC_MS: u32 = 35;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodeEditor {
@@ -37,6 +41,7 @@ pub struct CodeEditor {
     font: isize,
     gutter_timer: usize,
     highlight_timer: usize,
+    mark_timer: usize,
 }
 
 impl CodeEditor {
@@ -65,6 +70,7 @@ impl CodeEditor {
             font,
             gutter_timer: GUTTER_TIMER_BASE + id.max(0) as usize,
             highlight_timer: HIGHLIGHT_TIMER_BASE + id.max(0) as usize,
+            mark_timer: MARK_TIMER_BASE + id.max(0) as usize,
         };
         subclass_script_editor(script, editor);
         subclass_line_number_gutter(gutter, editor);
@@ -97,6 +103,7 @@ impl CodeEditor {
 
     pub unsafe fn set_text(self, text: &str) {
         RichEdit::new(self.script_hwnd()).set_text(text);
+        self.clear_error_line();
     }
 
     pub unsafe fn insert_line_at_end(self, line: &str) {
@@ -105,6 +112,21 @@ impl CodeEditor {
 
     pub unsafe fn focus_line(self, line: usize) {
         RichEdit::new(self.script_hwnd()).focus_line(line);
+        self.refresh_marks();
+    }
+
+    pub unsafe fn mark_error_line(self, line: usize) {
+        if let Some(data) = script_data_mut(self.script_hwnd()) {
+            data.error_line = Some(line.max(1));
+        }
+        self.refresh_marks();
+    }
+
+    pub unsafe fn clear_error_line(self) {
+        if let Some(data) = script_data_mut(self.script_hwnd()) {
+            data.error_line = None;
+        }
+        self.refresh_marks();
     }
 
     pub unsafe fn refresh_all(self) {
@@ -112,6 +134,23 @@ impl CodeEditor {
         let text = get_window_text(script);
         let spans = highlight_script_spans(&text);
         RichEdit::new(script).apply_highlights(rich_edit_text_units(&text), &spans, color_default());
+        self.refresh_marks();
+    }
+
+    pub unsafe fn refresh_marks(self) {
+        let script = self.script_hwnd();
+        let rich_edit = RichEdit::new(script);
+        let text = get_window_text(script);
+        let text_len = rich_edit_text_units(&text);
+        let current_line = Some(rich_edit.current_line());
+        let error_line = self.error_line();
+        rich_edit.apply_line_markers(
+            text_len,
+            current_line,
+            error_line,
+            color_current_line_background(),
+            color_error_line_background(),
+        );
         self.refresh_gutter();
     }
 
@@ -134,9 +173,17 @@ impl CodeEditor {
             KillTimer(to_hwnd(self.parent), self.highlight_timer);
             self.refresh_all();
             true
+        } else if timer_id == self.mark_timer {
+            KillTimer(to_hwnd(self.parent), self.mark_timer);
+            self.refresh_marks();
+            true
         } else {
             false
         }
+    }
+
+    unsafe fn error_line(self) -> Option<usize> {
+        script_data(self.script_hwnd()).and_then(|data| data.error_line)
     }
 }
 
@@ -144,6 +191,7 @@ impl CodeEditor {
 struct ScriptSubclassData {
     previous: WNDPROC,
     editor: CodeEditor,
+    error_line: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +208,7 @@ unsafe fn subclass_script_editor(hwnd: HWND, editor: CodeEditor) {
     let data = Box::new(ScriptSubclassData {
         previous: std::mem::transmute(previous),
         editor,
+        error_line: None,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
 }
@@ -212,7 +261,9 @@ unsafe extern "system" fn script_edit_proc(
         schedule_editor_highlight(data.editor);
     } else if msg == WM_MOUSEWHEEL {
         schedule_line_number_refresh_after_wheel(data.editor);
-    } else if matches!(msg, WM_KEYUP | WM_VSCROLL) {
+    } else if matches!(msg, WM_KEYUP | WM_LBUTTONUP | WM_SETFOCUS) {
+        schedule_editor_mark_refresh(data.editor);
+    } else if msg == WM_VSCROLL {
         PostMessageW(to_hwnd(data.editor.parent), CODE_EDITOR_REFRESH_GUTTER, 0, 0);
     }
     result
@@ -259,6 +310,11 @@ unsafe fn script_data(hwnd: HWND) -> Option<&'static ScriptSubclassData> {
     (!ptr.is_null()).then(|| &*ptr)
 }
 
+unsafe fn script_data_mut(hwnd: HWND) -> Option<&'static mut ScriptSubclassData> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ScriptSubclassData;
+    (!ptr.is_null()).then(|| &mut *ptr)
+}
+
 unsafe fn gutter_data(hwnd: HWND) -> Option<&'static GutterSubclassData> {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const GutterSubclassData;
     (!ptr.is_null()).then(|| &*ptr)
@@ -294,6 +350,12 @@ unsafe fn schedule_editor_highlight(editor: CodeEditor) {
     let parent = to_hwnd(editor.parent);
     PostMessageW(parent, CODE_EDITOR_REFRESH_GUTTER, 0, 0);
     SetTimer(parent, editor.highlight_timer, HIGHLIGHT_SYNC_MS, None);
+}
+
+unsafe fn schedule_editor_mark_refresh(editor: CodeEditor) {
+    let parent = to_hwnd(editor.parent);
+    PostMessageW(parent, CODE_EDITOR_REFRESH_MARKS, 0, 0);
+    SetTimer(parent, editor.mark_timer, MARK_SYNC_MS, None);
 }
 
 unsafe fn paint_line_number_gutter(hwnd: HWND, editor: CodeEditor) {
@@ -369,7 +431,12 @@ unsafe fn draw_line_number_gutter(hwnd: HWND, hdc: HDC, editor: CodeEditor) {
         let line_height = (metrics.tmHeight + metrics.tmExternalLeading).max(16);
         let rich_edit = RichEdit::new(script);
         let line_count = rich_edit.line_count();
+        let current_line = rich_edit.current_line();
+        let error_line = editor.error_line();
         let mut line = rich_edit.first_visible_line();
+        let current_brush = CreateSolidBrush(color_current_line_gutter());
+        let error_brush = CreateSolidBrush(color_error_line_gutter());
+        let error_marker_brush = CreateSolidBrush(color_error_marker());
 
         while line < line_count {
             let Some(y) = rich_edit.line_top(line) else {
@@ -379,7 +446,31 @@ unsafe fn draw_line_number_gutter(hwnd: HWND, hdc: HDC, editor: CodeEditor) {
                 break;
             }
             if y + line_height >= rect.top {
-                let number = format!("{}", line + 1);
+                let number_line = line + 1;
+                let line_rect = RECT {
+                    left: rect.left,
+                    top: y.max(rect.top),
+                    right: rect.right,
+                    bottom: (y + line_height).min(rect.bottom),
+                };
+                if error_line == Some(number_line) {
+                    FillRect(hdc, &line_rect, error_brush as HBRUSH);
+                    let marker_rect = RECT {
+                        left: rect.left + 2,
+                        top: (y + 2).max(rect.top),
+                        right: rect.left + 5,
+                        bottom: (y + line_height - 2).min(rect.bottom),
+                    };
+                    FillRect(hdc, &marker_rect, error_marker_brush as HBRUSH);
+                    SetTextColor(hdc, color_error_line_text());
+                } else if current_line == number_line {
+                    FillRect(hdc, &line_rect, current_brush as HBRUSH);
+                    SetTextColor(hdc, color_current_line_text());
+                } else {
+                    SetTextColor(hdc, rgb(86, 96, 112));
+                }
+
+                let number = format!("{number_line}");
                 let number = wide(&number);
                 TextOutW(
                     hdc,
@@ -392,6 +483,15 @@ unsafe fn draw_line_number_gutter(hwnd: HWND, hdc: HDC, editor: CodeEditor) {
             line += 1;
         }
 
+        if !current_brush.is_null() {
+            DeleteObject(current_brush as _);
+        }
+        if !error_brush.is_null() {
+            DeleteObject(error_brush as _);
+        }
+        if !error_marker_brush.is_null() {
+            DeleteObject(error_marker_brush as _);
+        }
         if !old_font.is_null() {
             SelectObject(hdc, old_font);
         }
@@ -821,6 +921,34 @@ fn color_builtin() -> u32 {
 
 fn color_command() -> u32 {
     rgb(20, 135, 95)
+}
+
+fn color_current_line_background() -> u32 {
+    rgb(238, 244, 255)
+}
+
+fn color_error_line_background() -> u32 {
+    rgb(255, 232, 232)
+}
+
+fn color_current_line_gutter() -> u32 {
+    rgb(225, 235, 250)
+}
+
+fn color_current_line_text() -> u32 {
+    rgb(45, 75, 120)
+}
+
+fn color_error_line_gutter() -> u32 {
+    rgb(255, 218, 218)
+}
+
+fn color_error_marker() -> u32 {
+    rgb(200, 45, 45)
+}
+
+fn color_error_line_text() -> u32 {
+    rgb(165, 30, 30)
 }
 
 const SCRIPT_KEYWORDS: &[&str] = &[
