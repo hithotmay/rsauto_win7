@@ -360,9 +360,11 @@ unsafe fn start_script() {
 }
 
 unsafe fn stop_script() {
-    let Some(app) = APP.get() else { return; };
-    let app = app.lock().unwrap();
-    if let Some(flag) = &app.stop_requested {
+    let stop_requested = {
+        let Some(app) = APP.get() else { return; };
+        app.lock().unwrap().stop_requested.clone()
+    };
+    if let Some(flag) = stop_requested {
         flag.store(true, Ordering::Relaxed);
         append_log("正在请求停止脚本...");
         set_status("正在停止...");

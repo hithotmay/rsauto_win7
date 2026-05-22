@@ -953,6 +953,31 @@ struct FunctionDef {
     body_end: usize,
 }
 
+struct ForRange {
+    current: i64,
+    stop: i64,
+    step: i64,
+}
+
+impl Iterator for ForRange {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let keep_going = if self.step > 0 {
+            self.current < self.stop
+        } else {
+            self.current > self.stop
+        };
+        if !keep_going {
+            return None;
+        }
+
+        let value = self.current;
+        self.current = self.current.saturating_add(self.step);
+        Some(value)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Value {
     Number(f64),
@@ -1250,7 +1275,7 @@ impl ScriptInterpreter {
         }
     }
 
-    fn parse_for(&mut self, text: &str, line_no: usize) -> Result<(String, Vec<i64>), RunError> {
+    fn parse_for(&mut self, text: &str, line_no: usize) -> Result<(String, ForRange), RunError> {
         let body = text
             .strip_prefix("for ")
             .and_then(|value| value.strip_suffix(':'))
@@ -1277,20 +1302,14 @@ impl ScriptInterpreter {
             return Err(line_error(line_no, "range 的 step 不能为 0"));
         }
 
-        let mut values = Vec::new();
-        let mut current = start;
-        if step > 0 {
-            while current < stop {
-                values.push(current);
-                current += step;
-            }
-        } else {
-            while current > stop {
-                values.push(current);
-                current += step;
-            }
-        }
-        Ok((var.trim().to_string(), values))
+        Ok((
+            var.trim().to_string(),
+            ForRange {
+                current: start,
+                stop,
+                step,
+            },
+        ))
     }
 
     fn command_from_call(
