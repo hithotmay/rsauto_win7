@@ -25,9 +25,10 @@ use screenshots::Screen;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW, RedrawWindow,
-        SelectClipRgn, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TextOutW, UpdateWindow,
-        COLOR_WINDOW, HDC, PAINTSTRUCT, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW,
+        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+        EndPaint, FillRect, GetSysColorBrush, GetTextMetricsW, RedrawWindow, SelectClipRgn,
+        SelectObject, SetBkMode, SetTextAlign, SetTextColor, TextOutW, UpdateWindow, COLOR_WINDOW,
+        HDC, PAINTSTRUCT, RDW_ERASE, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW, SRCCOPY,
         TA_RIGHT, TA_TOP, TEXTMETRICW, TRANSPARENT,
     },
     System::LibraryLoader::GetModuleHandleW,
@@ -394,6 +395,15 @@ unsafe extern "system" fn line_number_gutter_proc(
             paint_line_number_gutter(hwnd);
             0
         }
+        WM_MOUSEWHEEL => {
+            if let Some(app) = APP.get() {
+                let script = to_hwnd(app.lock().unwrap().script);
+                if !script.is_null() {
+                    SendMessageW(script, msg, wparam, lparam);
+                }
+            }
+            0
+        }
         _ => CallWindowProcW(LINE_NUMBER_GUTTER_PROC, hwnd, msg, wparam, lparam),
     }
 }
@@ -414,7 +424,38 @@ unsafe fn paint_line_number_gutter(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     SelectClipRgn(hdc, null_mut());
-    draw_line_number_gutter(hwnd, hdc);
+
+    let mut rect = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+
+    let mem_dc = CreateCompatibleDC(hdc);
+    let bitmap = if !mem_dc.is_null() && width > 0 && height > 0 {
+        CreateCompatibleBitmap(hdc, width, height)
+    } else {
+        null_mut()
+    };
+
+    if !mem_dc.is_null() && !bitmap.is_null() {
+        let old_bitmap = SelectObject(mem_dc, bitmap as _);
+        draw_line_number_gutter(hwnd, mem_dc);
+        BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+        if !old_bitmap.is_null() {
+            SelectObject(mem_dc, old_bitmap);
+        }
+        DeleteObject(bitmap as _);
+        DeleteDC(mem_dc);
+    } else {
+        draw_line_number_gutter(hwnd, hdc);
+        if !bitmap.is_null() {
+            DeleteObject(bitmap as _);
+        }
+        if !mem_dc.is_null() {
+            DeleteDC(mem_dc);
+        }
+    }
+
     EndPaint(hwnd, &ps);
 }
 
