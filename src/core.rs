@@ -215,6 +215,7 @@ enum Value {
     Number(f64),
     Text(String),
     Bool(bool),
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -223,6 +224,7 @@ impl Value {
             Value::Number(value) => *value != 0.0,
             Value::Text(value) => !value.is_empty(),
             Value::Bool(value) => *value,
+            Value::List(items) => !items.is_empty(),
         }
     }
 
@@ -232,6 +234,13 @@ impl Value {
             Value::Number(value) => format!("{value}"),
             Value::Text(value) => value.clone(),
             Value::Bool(value) => value.to_string(),
+            Value::List(items) => {
+                let inner: Vec<String> = items.iter().map(|v| match v {
+                    Value::Text(s) => format!("'{s}'"),
+                    other => other.to_script_string(),
+                }).collect();
+                format!("[{}]", inner.join(", "))
+            }
         }
     }
 
@@ -241,6 +250,7 @@ impl Value {
             Value::Number(_) => "float",
             Value::Text(_) => "str",
             Value::Bool(_) => "bool",
+            Value::List(_) => "list",
         }
     }
 
@@ -252,6 +262,7 @@ impl Value {
                 .trim()
                 .parse::<i64>()
                 .map_err(|_| line_error(line_no, &format!("cannot convert to int: {value}"))),
+            Value::List(_) => Err(line_error(line_no, "cannot convert list to int")),
         }
     }
 
@@ -263,6 +274,7 @@ impl Value {
                 .trim()
                 .parse::<f64>()
                 .map_err(|_| line_error(line_no, &format!("cannot convert to float: {value}"))),
+            Value::List(_) => Err(line_error(line_no, "cannot convert list to float")),
         }
     }
 }
@@ -272,6 +284,7 @@ enum Flow {
     Break,
     ContinueLoop,
     Goto(String),
+    Return(Value),
 }
 
 struct ScriptInterpreter {
@@ -320,9 +333,14 @@ impl ScriptInterpreter {
             match self.execute_at(pc, runner, log)? {
                 (Flow::Continue, next) => pc = next,
                 (Flow::Goto(label), _) => pc = self.goto_target(&label, self.lines[pc].line_no)?,
-                (Flow::Break, _) => return Err(line_error(self.lines[pc].line_no, "break outside loop")),
+                (Flow::Break, _) => {
+                    return Err(line_error(self.lines[pc].line_no, "break outside loop"))
+                }
                 (Flow::ContinueLoop, _) => {
                     return Err(line_error(self.lines[pc].line_no, "continue outside loop"));
+                }
+                (Flow::Return(_), _) => {
+                    return Err(line_error(self.lines[pc].line_no, "return outside function"));
                 }
             }
         }
@@ -381,7 +399,7 @@ impl ScriptInterpreter {
             runner.check_stop()?;
             match self.execute_at(pc, runner, log)? {
                 (Flow::Continue, next) => pc = next,
-                (flow @ (Flow::Break | Flow::ContinueLoop | Flow::Goto(_)), _) => return Ok(flow),
+                (flow @ (Flow::Break | Flow::ContinueLoop | Flow::Goto(_) | Flow::Return(_)), _) => return Ok(flow),
             }
         }
         Ok(Flow::Continue)
@@ -432,6 +450,15 @@ impl ScriptInterpreter {
         if text == "continue" {
             return Ok((Flow::ContinueLoop, pc + 1));
         }
+        if let Some(rest) = text.strip_prefix("return") {
+            let rest = rest.trim();
+            let value = if rest.is_empty() {
+                Value::Bool(false)
+            } else {
+                self.eval_expr(rest, line.line_no)?
+            };
+            return Ok((Flow::Return(value), pc + 1));
+        }
         if text.starts_with("for ") {
             let (var, values) = self.parse_for(text, line.line_no)?;
             let (body_start, body_end) = self.block_bounds(pc)?;
@@ -443,6 +470,7 @@ impl ScriptInterpreter {
                     Flow::ContinueLoop => continue,
                     Flow::Break => break,
                     flow @ Flow::Goto(_) => return Ok((flow, pc + 1)),
+                    flow @ Flow::Return(_) => return Ok((flow, pc + 1)),
                 }
             }
             return Ok((Flow::Continue, body_end));
@@ -465,6 +493,7 @@ impl ScriptInterpreter {
                     Flow::ContinueLoop => continue,
                     Flow::Break => break,
                     flow @ Flow::Goto(_) => return Ok((flow, pc + 1)),
+                    flow @ Flow::Return(_) => return Ok((flow, pc + 1)),
                 }
             }
             return Ok((Flow::Continue, body_end));
@@ -611,7 +640,10 @@ impl ScriptInterpreter {
 
         match result? {
             Flow::Continue => Ok(()),
-            Flow::Break => Err(line_error(line_no, "break from inside function is not supported")),
+            Flow::Break => Err(line_error(
+                line_no,
+                "break from inside function is not supported",
+            )),
             Flow::ContinueLoop => Err(line_error(
                 line_no,
                 "continue from inside function is not supported",
@@ -620,6 +652,7 @@ impl ScriptInterpreter {
                 line_no,
                 &format!("goto from inside function is not supported: {label}"),
             )),
+            Flow::Return(_) => Ok(()),
         }
     }
 
@@ -724,7 +757,7 @@ impl ScriptInterpreter {
         match self.eval_expr(expr, line_no)? {
             Value::Number(value) => Ok(value),
             Value::Bool(value) => Ok(if value { 1.0 } else { 0.0 }),
-            Value::Text(_) => Err(line_error(line_no, "number expression expected")),
+            Value::Text(_) | Value::List(_) => Err(line_error(line_no, "number expression expected")),
         }
     }
 
@@ -743,6 +776,52 @@ impl ScriptInterpreter {
         if expr.is_empty() {
             return Err(line_error(line_no, "empty expression"));
         }
+
+        // List literal: [item1, item2, ...]
+        if expr.starts_with('[') && expr.ends_with(']') {
+            let inner = &expr[1..expr.len() - 1];
+            if inner.trim().is_empty() {
+                return Ok(Value::List(Vec::new()));
+            }
+            let items = split_args(inner);
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(self.eval_expr(&item, line_no)?);
+            }
+            return Ok(Value::List(values));
+        }
+
+        // Subscript access: name[index]
+        if let Some(bracket_start) = expr.rfind('[') {
+            if expr.ends_with(']') {
+                let name = &expr[..bracket_start];
+                let index_expr = &expr[bracket_start + 1..expr.len() - 1];
+                if !name.is_empty() && !index_expr.is_empty() {
+                    let container = self.eval_expr(name, line_no)?;
+                    let index_val = self.eval_expr(index_expr, line_no)?;
+                    return match container {
+                        Value::List(items) => {
+                            let idx = index_val.to_int(line_no)? as usize;
+                            if idx < items.len() {
+                                Ok(items[idx].clone())
+                            } else {
+                                Err(line_error(line_no, &format!("list index {idx} out of range (len={})", items.len())))
+                            }
+                        }
+                        Value::Text(s) => {
+                            let idx = index_val.to_int(line_no)? as usize;
+                            if idx < s.len() {
+                                Ok(Value::Text(s.chars().nth(idx).unwrap().to_string()))
+                            } else {
+                                Err(line_error(line_no, &format!("string index {idx} out of range (len={})", s.len())))
+                            }
+                        }
+                        _ => Err(line_error(line_no, "subscript requires a list or string")),
+                    };
+                }
+            }
+        }
+
         if let Some(template) = parse_f_string(expr) {
             return Ok(Value::Text(self.eval_f_string(template, line_no)?));
         }
@@ -813,6 +892,83 @@ impl ScriptInterpreter {
                     self.eval_expr(arg, line_no)?.type_name().to_string(),
                 )))
             }
+            "len" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                let len = match &value {
+                    Value::List(items) => items.len(),
+                    Value::Text(s) => s.len(),
+                    _ => return Err(line_error(line_no, "len() requires a list or string")),
+                };
+                Ok(Some(Value::Number(len as f64)))
+            }
+            "append" => {
+                if args.len() != 2 {
+                    return Err(line_error(line_no, "append(list, value) requires 2 arguments"));
+                }
+                let list_val = self.eval_expr(&args[0], line_no)?;
+                let item = self.eval_expr(&args[1], line_no)?;
+                match list_val {
+                    Value::List(mut items) => {
+                        items.push(item);
+                        Ok(Some(Value::List(items)))
+                    }
+                    _ => Err(line_error(line_no, "append() first argument must be a list")),
+                }
+            }
+            "pop" => {
+                let list_val = self.eval_expr(&args[0], line_no)?;
+                match list_val {
+                    Value::List(mut items) => {
+                        if items.is_empty() {
+                            return Err(line_error(line_no, "pop() from empty list"));
+                        }
+                        let index = if args.len() > 1 {
+                            self.eval_expr(&args[1], line_no)?.to_int(line_no)? as usize
+                        } else {
+                            items.len() - 1
+                        };
+                        if index >= items.len() {
+                            return Err(line_error(line_no, "pop() index out of range"));
+                        }
+                        let removed = items.remove(index);
+                        Ok(Some(removed))
+                    }
+                    _ => Err(line_error(line_no, "pop() requires a list")),
+                }
+            }
+            "abs" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                Ok(Some(Value::Number(value.to_float(line_no)?.abs())))
+            }
+            "min" => {
+                if args.len() < 2 {
+                    return Err(line_error(line_no, "min() requires at least 2 arguments"));
+                }
+                let mut values = Vec::new();
+                for arg in &args {
+                    values.push(self.eval_expr(arg, line_no)?.to_float(line_no)?);
+                }
+                let min_val = values.into_iter().fold(f64::INFINITY, f64::min);
+                Ok(Some(Value::Number(min_val)))
+            }
+            "max" => {
+                if args.len() < 2 {
+                    return Err(line_error(line_no, "max() requires at least 2 arguments"));
+                }
+                let mut values = Vec::new();
+                for arg in &args {
+                    values.push(self.eval_expr(arg, line_no)?.to_float(line_no)?);
+                }
+                let max_val = values.into_iter().fold(f64::NEG_INFINITY, f64::max);
+                Ok(Some(Value::Number(max_val)))
+            }
+            "round" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?.to_float(line_no)?;
+                Ok(Some(Value::Number((value.round() as i64) as f64)))
+            }
             _ => Ok(None),
         }
     }
@@ -882,7 +1038,7 @@ impl ScriptInterpreter {
             return match value {
                 Value::Number(value) => Ok(Some(*value)),
                 Value::Bool(value) => Ok(Some(if *value { 1.0 } else { 0.0 })),
-                Value::Text(_) => Ok(None),
+                Value::Text(_) | Value::List(_) => Ok(None),
             };
         }
         Ok(None)
@@ -1124,6 +1280,7 @@ fn format_value(value: &Value, spec: &str, line_no: usize) -> Result<String, Run
             .parse::<f64>()
             .map(|value| format!("{value:.precision$}"))
             .map_err(|_| line_error(line_no, "f-string numeric format requires a number")),
+        Value::List(_) => Err(line_error(line_no, "f-string numeric format requires a number")),
     }
 }
 

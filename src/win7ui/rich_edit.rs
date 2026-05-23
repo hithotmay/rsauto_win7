@@ -11,8 +11,8 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             CreateWindowExW, SendMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-            ES_NOHIDESEL, ES_WANTRETURN, GWL_STYLE, SW_HIDE, SW_SHOW, WM_SETREDRAW, WS_CHILD,
-            WS_HSCROLL, WS_VISIBLE, WS_VSCROLL, WS_EX_CLIENTEDGE,
+            ES_NOHIDESEL, ES_WANTRETURN, GWL_STYLE, SW_HIDE, SW_SHOW, WM_SETREDRAW, WS_BORDER,
+            WS_CHILD, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL, WM_GETTEXTLENGTH,
         },
     },
 };
@@ -107,7 +107,7 @@ impl RichEdit {
         load_richedit();
         let class = wide("RichEdit50W");
         let hwnd = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            0, // 扁平：去掉 WS_EX_CLIENTEDGE
             class.as_ptr(),
             wide(text).as_ptr(),
             WS_CHILD
@@ -131,13 +131,14 @@ impl RichEdit {
         if hwnd.is_null() {
             let fallback = wide("RichEdit20W");
             let hwnd = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                0, // 扁平
                 fallback.as_ptr(),
                 wide(text).as_ptr(),
                 WS_CHILD
                     | WS_VISIBLE
                     | WS_VSCROLL
                     | WS_HSCROLL
+                    | WS_BORDER
                     | ES_MULTILINE as u32
                     | ES_AUTOVSCROLL as u32
                     | ES_AUTOHSCROLL as u32
@@ -179,6 +180,35 @@ impl RichEdit {
         );
     }
 
+    /// 在当前光标行之后插入一行文本
+    pub unsafe fn insert_after_current_line(self, line: &str) {
+        let mut range = CharRange { cp_min: 0, cp_max: 0 };
+        SendMessageW(self.hwnd, EM_EXGETSEL, 0, &mut range as *mut CharRange as LPARAM);
+        let cur_line_idx = SendMessageW(self.hwnd, EM_LINEFROMCHAR, range.cp_min as usize, 0);
+        // 获取下一行的起始位置
+        let next_line_start = SendMessageW(self.hwnd, EM_LINEINDEX, (cur_line_idx as usize).wrapping_add(1), 0);
+        let insert_pos = if next_line_start >= 0 {
+            next_line_start as usize
+        } else {
+            // 没有下一行，插入到文本末尾
+            let text_len = SendMessageW(self.hwnd, WM_GETTEXTLENGTH, 0, 0);
+            text_len.max(0) as usize
+        };
+        // 将插入点移到目标位置
+        SendMessageW(self.hwnd, EM_SETSEL, insert_pos as WPARAM, insert_pos as LPARAM);
+        let insert_line = line.replace(['\r', '\n'], " ");
+        let insert_line = insert_line.trim();
+        if insert_line.is_empty() {
+            return;
+        }
+        // 判断是否需要前缀换行
+        let current = super::get_window_text(self.hwnd);
+        let prefix = if current.is_empty() { "" } else { "\r\n" };
+        let text = wide(&format!("{prefix}{insert_line}"));
+        SendMessageW(self.hwnd, EM_REPLACESEL, 1, text.as_ptr() as LPARAM);
+        SendMessageW(self.hwnd, EM_SCROLLCARET, 0, 0);
+    }
+
     pub unsafe fn line_count(self) -> usize {
         SendMessageW(self.hwnd, EM_GETLINECOUNT, 0, 0).max(1) as usize
     }
@@ -193,8 +223,9 @@ impl RichEdit {
     }
 
     pub unsafe fn current_line(self) -> usize {
-        let pos = SendMessageW(self.hwnd, 0x00B0, 0, 0);
-        let line = SendMessageW(self.hwnd, EM_LINEFROMCHAR, pos as usize, 0);
+        let mut range = CharRange { cp_min: 0, cp_max: 0 };
+        SendMessageW(self.hwnd, EM_EXGETSEL, 0, &mut range as *mut CharRange as LPARAM);
+        let line = SendMessageW(self.hwnd, EM_LINEFROMCHAR, range.cp_min as usize, 0);
         line.max(0) as usize + 1
     }
 

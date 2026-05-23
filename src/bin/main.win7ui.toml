@@ -1,0 +1,241 @@
+# DTT — PyAuto Rust Win7 Native 全控件展示 UI
+# 包含所有 DTT/BTT 支持的控件类型，用于验证完整性
+
+[fonts]
+ui = { face = "Microsoft YaHei", size = 16 }
+fixed = { face = "NSimSun", size = 16 }
+
+[window]
+title = "PyAuto Rust - 全控件验证"
+width = 1280
+height = 860
+class = "PyAutoRsWin7Native"
+
+# ─── 热键 ──────────────────────────────────────────────────
+[[window.hotkeys]]
+id = 201
+key = "F5"
+
+[[window.hotkeys]]
+id = 202
+key = "F11"
+
+# ─── 1. 工具栏 Row — 按钮 + 输入框 + 下拉框 ──────────────
+[[window.children]]
+type = "row"
+layout = { size = [0, 42], margin = [6, 6, 0, 6] }
+
+  # 文件操作按钮组
+  [[window.children.children]]
+  type = "button"
+  id = 105
+  text = "打开"
+  layout = { size = [70, 30], margin = [0, 4, 6, 0] }
+
+  [[window.children.children]]
+  type = "button"
+  id = 106
+  text = "保存"
+  layout = { size = [70, 30], margin = [0, 4, 6, 0] }
+
+  [[window.children.children]]
+  type = "button"
+  id = 107
+  text = "另存为"
+  layout = { size = [80, 30], margin = [0, 4, 6, 0] }
+
+  # 分隔 Label
+  [[window.children.children]]
+  type = "label"
+  text = "│"
+  layout = { size = [12, 30], margin = [0, 4, 6, 4] }
+
+  # 脚本控制按钮组
+  [[window.children.children]]
+  type = "button"
+  id = 103
+  text = "▶ 运行 F5"
+  layout = { size = [100, 30], margin = [0, 4, 6, 0] }
+
+  [[window.children.children]]
+  type = "button"
+  id = 104
+  text = "■ 停止 F11"
+  layout = { size = [100, 30], margin = [0, 4, 6, 0] }
+
+  # 分隔 Label
+  [[window.children.children]]
+  type = "label"
+  text = "│"
+  layout = { size = [12, 30], margin = [0, 4, 6, 4] }
+
+  # 截图按钮组
+  [[window.children.children]]
+  type = "button"
+  id = 108
+  text = "框选截图"
+  layout = { size = [88, 30], margin = [0, 4, 6, 0] }
+
+  [[window.children.children]]
+  type = "button"
+  id = 109
+  text = "点击截图"
+  layout = { size = [88, 30], margin = [0, 4, 6, 0] }
+
+  [[window.children.children]]
+  type = "button"
+  id = 110
+  text = "捕获坐标"
+  layout = { size = [88, 30], margin = [0, 4, 6, 0] }
+
+  # 分隔 Label
+  [[window.children.children]]
+  type = "label"
+  text = "│"
+  layout = { size = [12, 30], margin = [0, 4, 6, 4] }
+
+  # ComboBox — 脚本语言选择
+  [[window.children.children]]
+  type = "combo_box"
+  id = 130
+  text = "PyAuto"
+  layout = { size = [110, 30], margin = [0, 4, 6, 0] }
+  props = { items = ["PyAuto", "Python", "JavaScript"], selected = 0 }
+
+  # Edit — 搜索框
+  [[window.children.children]]
+  type = "edit"
+  id = 131
+  text = ""
+  layout = { size = [140, 26], margin = [0, 4, 6, 0] }
+  props = { placeholder = "搜索..." }
+
+# ─── 2. 信息栏 Row — 进度条 + 状态 + Checkbox ─────────────
+[[window.children]]
+type = "row"
+layout = { size = [0, 32], margin = [0, 6, 4, 6] }
+
+  # 进度条
+  [[window.children.children]]
+  type = "progress_bar"
+  id = 132
+  layout = { size = [180, 20], margin = [0, 6, 6, 0] }
+  props = { min = 0, max = 100, value = 65 }
+
+  # 状态 Label
+  [[window.children.children]]
+  type = "label"
+  id = 120
+  text = "就绪。所有控件已加载。"
+  layout = { weight = 1, size = [0, 24], margin = [0, 6, 6, 0] }
+
+  # Checkbox — 自动换行
+  [[window.children.children]]
+  type = "checkbox"
+  id = 133
+  text = "自动换行"
+  layout = { size = [100, 22], margin = [0, 6, 6, 0] }
+  props = { checked = true }
+
+  # Checkbox — 行号
+  [[window.children.children]]
+  type = "checkbox"
+  id = 134
+  text = "显示行号"
+  layout = { size = [100, 22], margin = [0, 6, 6, 0] }
+  props = { checked = true }
+
+# ─── 3. 主内容区 — 左侧 Column（编辑器+控件面板），右侧 Column ──
+[[window.children]]
+type = "split"
+layout = { weight = 1, margin = [0, 6, 6, 6] }
+props = { split_right_width = 480 }
+
+  # ── 3a. 左侧 — Column: 编辑器 + Group(控件面板) ──
+  [[window.children.children]]
+  type = "column"
+  layout = { weight = 1 }
+
+    # 编辑器
+    [[window.children.children.children]]
+    type = "code_editor"
+    id = 101
+    layout = { weight = 1 }
+    props = { gutter_width = 48 }
+
+    # 底部 Group — 快速输入面板
+    [[window.children.children.children]]
+    type = "group"
+    text = "快速代码插入"
+    layout = { size = [0, 130], margin = [4, 4, 0, 0] }
+
+      # Row: 编辑框 + 按钮
+      [[window.children.children.children.children]]
+      type = "row"
+      layout = { size = [0, 30], margin = [6, 4, 4, 4] }
+
+        [[window.children.children.children.children.children]]
+        type = "edit"
+        id = 135
+        text = "click(100, 200)"
+        layout = { weight = 1, size = [0, 26], margin = [0, 0, 4, 0] }
+
+        [[window.children.children.children.children.children]]
+        type = "button"
+        id = 136
+        text = "插入"
+        layout = { size = [60, 26] }
+
+      # Row: 多行编辑 + ListBox
+      [[window.children.children.children.children]]
+      type = "split"
+      layout = { weight = 1, margin = [4, 4, 0, 4] }
+      props = { split_right_width = 200 }
+
+        [[window.children.children.children.children.children]]
+        type = "multiline_edit"
+        id = 137
+        text = "# 在此输入多行脚本代码\n# 可直接插入到编辑器中\n"
+        layout = { weight = 1 }
+        props = { hscroll = true }
+
+        [[window.children.children.children.children.children]]
+        type = "list_box"
+        id = 138
+        layout = { weight = 1 }
+        props = { items = ["click(x, y)", "type_text(\"hello\")", "wait(1.0)", "find_click(img)", "screenshot()", "mousemove(x, y)", "scroll(delta)", "press_key(\"Enter\")"], selected = 0 }
+
+  # ── 3b. 右侧 — Column: TabControl(日志+变量+帮助) ──
+  [[window.children.children]]
+  type = "column"
+  layout = { weight = 1 }
+
+    # TabControl — 多标签页
+    [[window.children.children.children]]
+    type = "tab_control"
+    id = 139
+    layout = { weight = 1 }
+    props = { tabs = ["日志输出", "变量监视", "快捷帮助"] }
+
+      # ── Tab 页面 1: 日志输出 ──
+      [[window.children.children.children.children]]
+      type = "log_view"
+      id = 102
+      layout = { weight = 1 }
+      props = { log_max_chars = 80000 }
+
+      # ── Tab 页面 2: 变量监视 ──
+      [[window.children.children.children.children]]
+      type = "multiline_edit"
+      id = 140
+      text = "变量监视器\n─────────────\n运行脚本后，变量将在此显示。\n\n支持格式：\n  名称 = 值\n  x = 100\n  y = 200"
+      layout = { weight = 1 }
+      props = { readonly = true, hscroll = false }
+
+      # ── Tab 页面 3: 快捷帮助 ──
+      [[window.children.children.children.children]]
+      type = "multiline_edit"
+      id = 141
+      text = "══════════════════════════════\n       PyAuto 脚本快速参考\n══════════════════════════════\n\n◆ 鼠标操作\n  click(x, y)          左键点击\n  mousemove(x, y)      移动鼠标\n  scroll(delta)         滚轮滚动\n\n◆ 键盘操作\n  type_text(\"text\")     输入文字\n  press_key(\"Enter\")    按键\n  hotkey(\"Ctrl+C\")      组合键\n\n◆ 等待与延迟\n  wait(seconds)         等待秒数\n  wait_until(img, t)    等待图片出现\n\n◆ 屏幕截图\n  screenshot()          全屏截图\n  find_click(img, t)    找图点击\n\n◆ 流程控制\n  if/elif/else/endif    条件判断\n  while/endw            循环\n  for i in range(n)     计数循环\n  goto label            跳转\n\n◆ 快捷键\n  F5  运行脚本\n  F11 停止运行\n"
+      layout = { weight = 1 }
+      props = { readonly = true, hscroll = true }

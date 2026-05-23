@@ -1,4 +1,4 @@
-﻿#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 #[path = "../core.rs"]
 mod core;
@@ -23,8 +23,10 @@ use image::{imageops, RgbaImage};
 use pyauto_rs::win7ui;
 use screenshots::Screen;
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::{UpdateWindow, COLOR_WINDOW},
+    Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Graphics::Gdi::{
+        CreateSolidBrush, FillRect, HBRUSH, SetBkColor, SetTextColor, UpdateWindow, COLOR_WINDOW,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE},
@@ -32,6 +34,11 @@ use windows_sys::Win32::{
     },
 };
 
+// WM_NOTIFY / NMHDR / TCN_SELCHANGE 所需的常量
+const WM_NOTIFY: u32 = 0x004E;
+const TCN_SELCHANGE: u32 = 0xFFFFFDD9;
+
+// ─── 控件 ID（与 TOML 定义一一对应）──────────────────────────
 const IDC_SCRIPT: i32 = 101;
 const IDC_LOG: i32 = 102;
 const IDC_RUN: i32 = 103;
@@ -42,6 +49,21 @@ const IDC_SAVE_AS: i32 = 107;
 const IDC_CAPTURE: i32 = 108;
 const IDC_CLICK_IMAGE: i32 = 109;
 const IDC_CAPTURE_POINT: i32 = 110;
+const IDC_STATUS: i32 = 120;
+
+// 新增控件 ID（全控件验证）
+const IDC_COMBO_LANG: i32 = 130;
+const IDC_EDIT_SEARCH: i32 = 131;
+const IDC_PROGRESS: i32 = 132;
+const IDC_CHECK_WRAP: i32 = 133;
+const IDC_CHECK_LINENO: i32 = 134;
+const IDC_EDIT_INSERT: i32 = 135;
+const IDC_BTN_INSERT: i32 = 136;
+const IDC_MULTILINE: i32 = 137;
+const IDC_LIST_SNIPPETS: i32 = 138;
+const IDC_TAB_CTRL: i32 = 139;
+const IDC_VAR_VIEW: i32 = 140;
+const IDC_HELP_VIEW: i32 = 141;
 
 const IDC_CONFIRM_DIR: i32 = 301;
 const IDC_CONFIRM_FILE: i32 = 302;
@@ -60,6 +82,25 @@ const MAX_RUN_LOG_LINES: usize = 1000;
 const LOG_SNAPSHOT_INTERVAL_MS: u64 = 160;
 const RUN_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_RUN, VK_F5);
 const STOP_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_STOP, VK_F11);
+
+// ─── 扁平配色方案 ───────────────────────────────────────────
+const CLR_BG: COLORREF = 0x00F0F0F0; // 窗口背景：浅灰
+const CLR_EDIT_BG: COLORREF = 0x00FFFFFF; // 编辑框背景：白色
+const CLR_TEXT: COLORREF = 0x001A1A1A; // 文字颜色：深灰黑
+const CLR_BTN_BG: COLORREF = 0x00E0E0E0; // 按钮背景
+
+static mut FLAT_BG_BRUSH: HBRUSH = std::ptr::null_mut();
+static mut FLAT_EDIT_BRUSH: HBRUSH = std::ptr::null_mut();
+static mut FLAT_BTN_BRUSH: HBRUSH = std::ptr::null_mut();
+
+unsafe fn init_flat_brushes() {
+    FLAT_BG_BRUSH = CreateSolidBrush(CLR_BG);
+    FLAT_EDIT_BRUSH = CreateSolidBrush(CLR_EDIT_BG);
+    FLAT_BTN_BRUSH = CreateSolidBrush(CLR_BTN_BG);
+}
+
+/// 嵌入式 UI 定义（编译时绑定，零外部文件依赖）
+const UI_TOML: &str = include_str!("main.win7ui.toml");
 
 const SAMPLE_SCRIPT: &str = r#"# Win7 原生模式：无 OpenGL，支持中文
 x = 1
@@ -83,27 +124,55 @@ print(f'你好，x = {x}')
 # find_click("captures/click_image.png", 0.92, 3000)
 "#;
 
-#[derive(Default)]
+// ─── 应用状态 ───────────────────────────────────────────────
+
 struct AppState {
     hwnd: isize,
-    editor: win7ui::CodeEditor,
-    log: isize,
-    status: isize,
-    run_button: isize,
-    stop_button: isize,
-    open_button: isize,
-    save_button: isize,
-    save_as_button: isize,
-    capture_button: isize,
-    click_image_button: isize,
-    capture_point_button: isize,
-    fonts: win7ui::UiFonts,
+    /// DTT+BTT 构建的控件树（替代所有单独 HWND 字段）
+    built: Option<win7ui::BuiltTree>,
     running: bool,
     stop_requested: Option<Arc<AtomicBool>>,
     rx: Option<Receiver<AppEvent>>,
     current_file: Option<PathBuf>,
     capture: Option<CaptureState>,
     confirm: Option<ConfirmState>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            hwnd: 0,
+            built: None,
+            running: false,
+            stop_requested: None,
+            rx: None,
+            current_file: None,
+            capture: None,
+            confirm: None,
+        }
+    }
+}
+
+impl AppState {
+    /// 按 ID 获取 CodeEditor（Copy 类型，无借用问题）
+    fn editor(&self) -> Option<win7ui::CodeEditor> {
+        self.built.as_ref()?.code_editor_by_id(IDC_SCRIPT).copied()
+    }
+
+    /// 按 ID 获取 LogView（Copy 类型）
+    fn log_view(&self) -> Option<win7ui::LogView> {
+        self.built.as_ref()?.log_view_by_id(IDC_LOG).copied()
+    }
+
+    /// 按 ID 获取状态栏 HWND
+    fn status_hwnd(&self) -> Option<HWND> {
+        self.built.as_ref()?.hwnd_by_id(IDC_STATUS)
+    }
+
+    /// 按 ID 获取按钮 HWND
+    fn button(&self, id: i32) -> Option<HWND> {
+        self.built.as_ref()?.hwnd_by_id(id)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -166,6 +235,10 @@ enum AppEvent {
     },
 }
 
+// Safety: AppState is only accessed from the UI thread (via Mutex inside AppStore).
+// HWND/isize values are Win32 handles, safe to move across threads as opaque integers.
+unsafe impl Send for AppState {}
+
 static APP: win7ui::AppStore<AppState> = win7ui::AppStore::new();
 
 fn to_hwnd(value: isize) -> HWND {
@@ -175,6 +248,8 @@ fn to_hwnd(value: isize) -> HWND {
 fn hwnd_value(value: HWND) -> isize {
     value as isize
 }
+
+// ─── 入口 ───────────────────────────────────────────────────
 
 fn main() {
     unsafe {
@@ -202,9 +277,12 @@ fn main() {
     }
 }
 
+// ─── 主窗口过程 ─────────────────────────────────────────────
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
+            init_flat_brushes();
             create_controls(hwnd);
             append_log("Win7 原生模式已启动。F5 运行，F11 停止。");
             0
@@ -223,9 +301,34 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 IDC_CAPTURE => begin_capture(CaptureMode::SaveRegion),
                 IDC_CLICK_IMAGE => begin_capture(CaptureMode::ClickImage),
                 IDC_CAPTURE_POINT => begin_capture(CaptureMode::PointClick),
+                IDC_BTN_INSERT => handle_insert_button(),
                 _ => {}
             }
             0
+        }
+        WM_NOTIFY => {
+            // TabControl 页面切换
+            if let Some(app) = APP.get() {
+                let mut app = app.lock().unwrap();
+                if let Some(ref mut built) = app.built {
+                    // NMHDR: hwndFrom, idFrom, code
+                    #[repr(C)]
+                    struct Nmhdr {
+                        _hwnd_from: isize,
+                        id_from: usize,
+                        code: isize,
+                    }
+                    let nmhdr = &*(lparam as *const Nmhdr);
+                    if nmhdr.code as u32 == TCN_SELCHANGE && nmhdr.id_from as i32 == IDC_TAB_CTRL {
+                        let tab_hwnd = built.hwnd_by_id(IDC_TAB_CTRL);
+                        if let Some(th) = tab_hwnd {
+                            let sel = win7ui::tab_get_selected(th) as usize;
+                            built.switch_tab(IDC_TAB_CTRL, sel);
+                        }
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_HOTKEY => {
             match wparam as i32 {
@@ -252,6 +355,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             refresh_editor_marks();
             0
         }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            // 按钮和静态标签：用背景色画刷
+            SetTextColor(wparam as _, CLR_TEXT);
+            SetBkColor(wparam as _, CLR_BG);
+            FLAT_BG_BRUSH as _
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            // 编辑框和列表：白底
+            SetTextColor(wparam as _, CLR_TEXT);
+            SetBkColor(wparam as _, CLR_EDIT_BG);
+            FLAT_EDIT_BRUSH as _
+        }
+        WM_ERASEBKGND => {
+            // 窗口背景擦除：用背景画刷填充
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            FillRect(wparam as _, &rc, FLAT_BG_BRUSH as _);
+            1
+        }
         WM_DESTROY => {
             destroy_fonts();
             PostQuitMessage(0);
@@ -261,55 +383,36 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
-unsafe fn destroy_fonts() {
-    if let Some(app) = APP.get() {
-        let mut app = app.lock().unwrap();
-        app.fonts.destroy();
-    }
-}
+// ─── UI 创建（DTT+BTT 驱动）─────────────────────────────────
 
 unsafe fn create_controls(hwnd: HWND) {
-    let open_button = win7ui::create_button(hwnd, "打开", IDC_OPEN);
-    let save_button = win7ui::create_button(hwnd, "保存", IDC_SAVE);
-    let save_as_button = win7ui::create_button(hwnd, "另存为", IDC_SAVE_AS);
-    let run_button = win7ui::create_button(hwnd, "运行 F5", IDC_RUN);
-    let stop_button = win7ui::create_button(hwnd, "停止 F11", IDC_STOP);
-    let capture_button = win7ui::create_button(hwnd, "框选截图", IDC_CAPTURE);
-    let click_image_button = win7ui::create_button(hwnd, "点击截图", IDC_CLICK_IMAGE);
-    let capture_point_button = win7ui::create_button(hwnd, "捕获坐标", IDC_CAPTURE_POINT);
+    let built = match win7ui::Ui::from_toml(UI_TOML, hwnd) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("DTT+BTT 构建 UI 失败：{err}");
+            return;
+        }
+    };
 
-    let status = win7ui::create_label(hwnd, "就绪。编辑器 Tab 会插入 4 个空格。", 10, 44, 400, 22);
-    let fonts = win7ui::UiFonts::win7_defaults();
-    let editor = win7ui::CodeEditor::create(hwnd, SAMPLE_SCRIPT, IDC_SCRIPT, 10, 70, 650, 620, 48, fonts.editor);
-    let log = win7ui::create_multiline_edit(hwnd, "", IDC_LOG, 670, 70, 420, 620, true, false);
-    win7ui::apply_font_handle(status, fonts.ui);
-    win7ui::apply_font_handle_to_many(&[
-        open_button,
-        save_button,
-        save_as_button,
-        run_button,
-        stop_button,
-        capture_button,
-        click_image_button,
-        capture_point_button,
-    ], fonts.ui);
-    win7ui::apply_font_handle(log, fonts.log);
+    // 设置示例脚本（TOML 中 CodeEditor 的 text 为空）
+    if let Some(ce) = built.code_editor_by_id(IDC_SCRIPT) {
+        ce.set_text(SAMPLE_SCRIPT);
+    }
 
     if let Some(app) = APP.get() {
         let mut app = app.lock().unwrap();
         app.hwnd = hwnd_value(hwnd);
-        app.editor = editor;
-        app.log = hwnd_value(log);
-        app.status = hwnd_value(status);
-        app.run_button = hwnd_value(run_button);
-        app.stop_button = hwnd_value(stop_button);
-        app.open_button = hwnd_value(open_button);
-        app.save_button = hwnd_value(save_button);
-        app.save_as_button = hwnd_value(save_as_button);
-        app.capture_button = hwnd_value(capture_button);
-        app.click_image_button = hwnd_value(click_image_button);
-        app.capture_point_button = hwnd_value(capture_point_button);
-        app.fonts = fonts;
+
+        // ── 扁平化：进度条颜色 ──
+        if let Some(pb) = built.hwnd_by_id(IDC_PROGRESS) {
+            win7ui::controls::progress_set_flat_colors(
+                pb,
+                0x00CC6600, // bar: 深橙
+                0x00E0E0E0, // bg: 浅灰
+            );
+        }
+
+        app.built = Some(built);
     }
 
     update_running_ui(false);
@@ -317,45 +420,43 @@ unsafe fn create_controls(hwnd: HWND) {
     refresh_editor_view();
 }
 
-unsafe fn current_ui_font() -> HWND {
-    APP.get()
-        .map(|app| app.lock().unwrap().fonts.ui)
-        .map(|font| font as HWND)
-        .unwrap_or(null_mut())
-}
+// ─── 布局（BTT 自动处理）────────────────────────────────────
 
 unsafe fn layout_controls(hwnd: HWND) {
     let mut rect = std::mem::zeroed();
     GetClientRect(hwnd, &mut rect);
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
+    let w = rect.right - rect.left;
+    let h = rect.bottom - rect.top;
 
     if let Some(app) = APP.get() {
-        let app = app.lock().unwrap();
-        win7ui::row_layout(
-            &[
-                (to_hwnd(app.open_button), 76),
-                (to_hwnd(app.save_button), 76),
-                (to_hwnd(app.save_as_button), 86),
-                (to_hwnd(app.run_button), 92),
-                (to_hwnd(app.stop_button), 96),
-                (to_hwnd(app.capture_button), 98),
-                (to_hwnd(app.click_image_button), 98),
-                (to_hwnd(app.capture_point_button), 98),
-            ],
-            10,
-            10,
-            28,
-            8,
-        );
-
-        win7ui::move_window(to_hwnd(app.status), 10, 44, width - 20, 22);
-
-        let split = win7ui::split_left_right(width, height, 10, 70, 10, 410, 250);
-        app.editor.layout(split.left_x, split.y, split.left_w, split.h, 48);
-        win7ui::move_window(to_hwnd(app.log), split.right_x, split.y, split.right_w, split.h);
+        let mut app = app.lock().unwrap();
+        if let Some(ref mut built) = app.built {
+            built.on_resize(w, h);
+        }
     }
 }
+
+// ─── 字体 ───────────────────────────────────────────────────
+
+unsafe fn destroy_fonts() {
+    if let Some(app) = APP.get() {
+        let mut app = app.lock().unwrap();
+        if let Some(ref built) = app.built {
+            win7ui::destroy_font(built.ui_font as HWND);
+            win7ui::destroy_font(built.fixed_font as HWND);
+        }
+    }
+}
+
+unsafe fn current_ui_font() -> HWND {
+    APP.get()
+        .and_then(|app| {
+            app.lock().unwrap().built.as_ref().map(|b| b.ui_font as HWND)
+        })
+        .unwrap_or(null_mut())
+}
+
+// ─── 脚本运行 ───────────────────────────────────────────────
 
 unsafe fn start_script() {
     let (script, tx, stop_requested) = {
@@ -365,8 +466,9 @@ unsafe fn start_script() {
             append_log("脚本已经在运行，忽略重复运行请求。");
             return;
         }
-        app.editor.clear_error_line();
-        let script = app.editor.text();
+        let editor = app.editor().unwrap();
+        editor.clear_error_line();
+        let script = editor.text();
         let (tx, rx) = win7ui::event_channel(to_hwnd(app.hwnd), WM_APP);
         let stop_requested = Arc::new(AtomicBool::new(false));
         app.running = true;
@@ -456,13 +558,16 @@ fn run_error_line(err: &RunError) -> Option<usize> {
     }
 }
 
+// ─── 文件操作 ───────────────────────────────────────────────
+
 unsafe fn open_script() {
     let Some(path) = choose_script_file(false) else { return; };
     match fs::read_to_string(&path) {
         Ok(text) => {
             if let Some(app) = APP.get() {
                 let mut app = app.lock().unwrap();
-                app.editor.set_text(&text);
+                let editor = app.editor().unwrap();
+                editor.set_text(&text);
                 app.current_file = Some(path.clone());
             }
             refresh_editor_view();
@@ -477,7 +582,8 @@ unsafe fn save_script(force_dialog: bool) {
     let (text, existing) = {
         let Some(app) = APP.get() else { return; };
         let app = app.lock().unwrap();
-        (app.editor.text(), app.current_file.clone())
+        let editor = app.editor().unwrap();
+        (editor.text(), app.current_file.clone())
     };
 
     let path = if force_dialog {
@@ -512,6 +618,8 @@ unsafe fn choose_script_file(save: bool) -> Option<PathBuf> {
         "txt",
     )
 }
+
+// ─── 截图功能 ───────────────────────────────────────────────
 
 unsafe fn begin_capture(mode: CaptureMode) {
     let (tx, target_hwnd) = {
@@ -575,8 +683,6 @@ unsafe fn show_capture_overlay(mode: CaptureMode, captured: CapturedScreen) {
         return;
     }
 
-    // Win7 treats color-keyed transparent layered windows as hit-test transparent in
-    // practice on some machines, so use a real alpha overlay that still receives input.
     SetLayeredWindowAttributes(overlay, 0, 90, LWA_ALPHA);
     ShowWindow(overlay, SW_SHOW);
     UpdateWindow(overlay);
@@ -603,6 +709,8 @@ unsafe fn show_capture_overlay(mode: CaptureMode, captured: CapturedScreen) {
         });
     }
 }
+
+// ─── 截图覆盖层窗口过程 ─────────────────────────────────────
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
@@ -719,6 +827,8 @@ fn capture_rect(capture: &CaptureState) -> Option<ImageRect> {
         height: rect.height() as u32,
     })
 }
+
+// ─── 确认窗口 ───────────────────────────────────────────────
 
 unsafe fn show_confirm_window() {
     let Some(app_lock) = APP.get() else { return; };
@@ -1029,40 +1139,77 @@ unsafe fn finish_capture() {
     set_status("就绪");
 }
 
+// ─── 编辑器辅助 ─────────────────────────────────────────────
+
 unsafe fn insert_script_line(line: &str) {
     let Some(app) = APP.get() else { return; };
-    app.lock().unwrap().editor.insert_line_at_end(line);
+    let editor = app.lock().unwrap().editor().unwrap();
+    editor.insert_after_current_line(line);
     refresh_editor_view();
+}
+
+/// 插入按钮：从 IDC_EDIT_INSERT 读取文本，插入到编辑器末尾
+unsafe fn handle_insert_button() {
+    let Some(app) = APP.get() else { return; };
+    let text = {
+        let app = app.lock().unwrap();
+        if let Some(ref built) = app.built {
+            if let Some(h) = built.hwnd_by_id(IDC_EDIT_INSERT) {
+                Some(win7ui::get_window_text(h))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(t) = text {
+        if !t.is_empty() {
+            insert_script_line(&t);
+            // 清空输入框
+            let app = app.lock().unwrap();
+            if let Some(ref built) = app.built {
+                if let Some(h) = built.hwnd_by_id(IDC_EDIT_INSERT) {
+                    win7ui::set_window_text(h, "");
+                }
+            }
+        }
+    }
 }
 
 unsafe fn refresh_editor_view() {
     let Some(app) = APP.get() else { return; };
-    app.lock().unwrap().editor.refresh_all();
+    let editor = app.lock().unwrap().editor().unwrap();
+    editor.refresh_all();
 }
 
 unsafe fn refresh_line_numbers() {
     let Some(app) = APP.get() else { return; };
-    app.lock().unwrap().editor.refresh_gutter();
+    let editor = app.lock().unwrap().editor().unwrap();
+    editor.refresh_gutter();
 }
 
 unsafe fn refresh_editor_marks() {
     let Some(app) = APP.get() else { return; };
-    app.lock().unwrap().editor.refresh_marks();
+    let editor = app.lock().unwrap().editor().unwrap();
+    editor.refresh_marks();
 }
 
 unsafe fn handle_editor_timer(timer_id: WPARAM) -> bool {
     APP.get()
-        .map(|app| app.lock().unwrap().editor.handle_timer(timer_id))
+        .and_then(|app| app.lock().unwrap().editor().map(|ce| ce.handle_timer(timer_id)))
         .unwrap_or(false)
 }
 
 unsafe fn focus_script_line(line: usize) {
     let Some(app) = APP.get() else { return; };
-    let editor = app.lock().unwrap().editor;
+    let editor = app.lock().unwrap().editor().unwrap();
     editor.mark_error_line(line);
     editor.focus_line(line);
     set_status(&format!("运行出错，已定位到第 {line} 行。"));
 }
+
+// ─── 事件处理 ───────────────────────────────────────────────
 
 unsafe fn drain_events() {
     let rx = {
@@ -1119,45 +1266,51 @@ unsafe fn drain_events() {
     }
 }
 
+// ─── UI 更新辅助 ────────────────────────────────────────────
+
 unsafe fn update_running_ui(running: bool) {
     if let Some(app) = APP.get() {
         let app = app.lock().unwrap();
-        let enabled = !running;
-        win7ui::enable_window(to_hwnd(app.run_button), enabled);
-        win7ui::enable_window(to_hwnd(app.open_button), enabled);
-        win7ui::enable_window(to_hwnd(app.save_button), enabled);
-        win7ui::enable_window(to_hwnd(app.save_as_button), enabled);
-        win7ui::enable_window(to_hwnd(app.capture_button), enabled);
-        win7ui::enable_window(to_hwnd(app.click_image_button), enabled);
-        win7ui::enable_window(to_hwnd(app.capture_point_button), enabled);
+        if let Some(built) = app.built.as_ref() {
+            let enabled = !running;
+            for &id in &[IDC_RUN, IDC_OPEN, IDC_SAVE, IDC_SAVE_AS, IDC_CAPTURE, IDC_CLICK_IMAGE, IDC_CAPTURE_POINT] {
+                if let Some(h) = built.hwnd_by_id(id) {
+                    win7ui::enable_window(h, enabled);
+                }
+            }
+        }
     }
     set_status(if running { "运行中... F11 可停止" } else { "就绪" });
 }
 
 unsafe fn append_log(line: &str) {
-    log_view().append_line(line);
+    if let Some(lv) = get_log_view() {
+        lv.append_line(line);
+    }
 }
 
 unsafe fn replace_log_snapshot(lines: &[String], total_lines: usize) {
-    log_view().replace_snapshot(lines, total_lines, MAX_RUN_LOG_LINES);
+    if let Some(lv) = get_log_view() {
+        lv.replace_snapshot(lines, total_lines, MAX_RUN_LOG_LINES);
+    }
 }
 
 unsafe fn clear_log() {
-    log_view().clear();
+    if let Some(lv) = get_log_view() {
+        lv.clear();
+    }
 }
 
-unsafe fn log_view() -> win7ui::LogView {
-    let log = APP
-        .get()
-        .map(|app| to_hwnd(app.lock().unwrap().log))
-        .unwrap_or(null_mut());
-    win7ui::LogView::new(log, MAX_LOG_CHARS)
+unsafe fn get_log_view() -> Option<win7ui::LogView> {
+    APP.get().and_then(|app| app.lock().unwrap().log_view())
 }
 
 unsafe fn set_status(text: &str) {
     let Some(app) = APP.get() else { return; };
-    let status = to_hwnd(app.lock().unwrap().status);
-    win7ui::set_window_text(status, text);
+    let app = app.lock().unwrap();
+    if let Some(status) = app.status_hwnd() {
+        win7ui::set_window_text(status, text);
+    }
 }
 
 unsafe fn main_hwnd() -> HWND {

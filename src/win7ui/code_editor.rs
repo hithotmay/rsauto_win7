@@ -12,7 +12,10 @@ use windows_sys::Win32::{
     },
     UI::{
         Controls::EM_REPLACESEL,
-        Input::KeyboardAndMouse::{VK_DELETE, VK_TAB},
+        Input::KeyboardAndMouse::{
+            VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_TAB,
+            VK_UP,
+        },
         WindowsAndMessaging::*,
     },
 };
@@ -60,6 +63,13 @@ impl CodeEditor {
         let script_x = x + gutter_width + 4;
         let script_w = (w - gutter_width - 4).max(1);
         let script = RichEdit::create(parent, text, id, script_x, y, script_w, h).hwnd();
+
+        // 扁平化：禁用视觉主题
+        unsafe {
+            super::controls::set_flat_theme(gutter);
+            super::controls::set_flat_theme(script);
+        }
+
         apply_font_handle(gutter, font);
         apply_font_handle(script, font);
 
@@ -108,6 +118,10 @@ impl CodeEditor {
 
     pub unsafe fn insert_line_at_end(self, line: &str) {
         insert_line_at_end(self.script_hwnd(), line);
+    }
+
+    pub unsafe fn insert_after_current_line(self, line: &str) {
+        RichEdit::new(self.script_hwnd()).insert_after_current_line(line);
     }
 
     pub unsafe fn focus_line(self, line: usize) {
@@ -259,12 +273,21 @@ unsafe extern "system" fn script_edit_proc(
         schedule_editor_highlight(data.editor);
     } else if msg == WM_KEYDOWN && wparam as u32 == VK_DELETE as u32 {
         schedule_editor_highlight(data.editor);
+    } else if msg == WM_KEYDOWN {
+        // 方向键 / Home / End / PageUp / PageDown 等导航键移动光标
+        let vk = wparam as u32;
+        // VK_UP=0x26 VK_DOWN=0x28 VK_LEFT=0x25 VK_RIGHT=0x27
+        // VK_HOME=0x24 VK_END=0x23 VK_PRIOR=0x21 VK_NEXT=0x22
+        if matches!(vk, 0x26 | 0x28 | 0x25 | 0x27 | 0x24 | 0x23 | 0x21 | 0x22) {
+            schedule_editor_mark_refresh(data.editor);
+        }
+    } else if matches!(msg, WM_KEYUP | WM_LBUTTONUP | WM_LBUTTONDOWN | WM_SETFOCUS) {
+        schedule_editor_mark_refresh(data.editor);
     } else if msg == WM_MOUSEWHEEL {
         schedule_line_number_refresh_after_wheel(data.editor);
-    } else if matches!(msg, WM_KEYUP | WM_LBUTTONUP | WM_SETFOCUS) {
-        schedule_editor_mark_refresh(data.editor);
     } else if msg == WM_VSCROLL {
         PostMessageW(to_hwnd(data.editor.parent), CODE_EDITOR_REFRESH_GUTTER, 0, 0);
+        schedule_editor_mark_refresh(data.editor);
     }
     result
 }

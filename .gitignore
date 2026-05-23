@@ -2,5 +2,7 @@
 captures/
 src/captures/
 output.png
+screenshot.png
 *.log
 *.tmp
+pyauto.manifest
