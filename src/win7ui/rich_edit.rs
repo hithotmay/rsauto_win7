@@ -429,9 +429,6 @@ impl RichEdit {
         self.restore_scroll_pos(scroll_pos);
         SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
         self.finish_redraw();
-        // EM_SETCHARFORMAT(SCF_SELECTION) 会往 undo 栈塞格式变更记录，
-        // 导致 Ctrl+Z 撤回的是颜色变更而非文字变更。清空 undo 栈。
-        SendMessageW(self.hwnd, 0x00CE /* EM_EMPTYUNDOBUFFER */, 0, 0);
     }
 
     pub unsafe fn apply_line_markers(
@@ -481,7 +478,6 @@ impl RichEdit {
         self.restore_scroll_pos(scroll_pos);
         SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
         self.finish_redraw();
-        SendMessageW(self.hwnd, 0x00CE /* EM_EMPTYUNDOBUFFER */, 0, 0);
     }
 
     /// Search for text starting from `start_pos` (UTF-16 char index), case-insensitive.
