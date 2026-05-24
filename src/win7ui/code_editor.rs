@@ -609,7 +609,7 @@ unsafe extern "system" fn script_edit_proc(
         }
     }
 
-    // Ctrl+Z : undo, Ctrl+Shift+Z : redo
+    // Ctrl+Shift+Z : redo (Ctrl+Z undo 由 RichEdit 自己处理，不拦截)
     if msg == WM_KEYDOWN && wparam as u32 == VK_Z as u32 {
         let ctrl = GetKeyState(VK_CONTROL as i32) as u16;
         if (ctrl & 0x8000) != 0 {
@@ -617,12 +617,9 @@ unsafe extern "system" fn script_edit_proc(
             if (shift & 0x8000) != 0 {
                 // Ctrl+Shift+Z → Redo
                 SendMessageW(hwnd, 0x0454 /* EM_REDO */, 0, 0);
-            } else {
-                // Ctrl+Z → Undo
-                SendMessageW(hwnd, EM_UNDO, 0, 0);
+                schedule_editor_highlight(data.editor);
+                return 0;
             }
-            schedule_editor_highlight(data.editor);
-            return 0;
         }
     }
 
