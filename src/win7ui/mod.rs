@@ -10,7 +10,6 @@ pub mod hotkey;
 pub mod layout;
 pub mod log_view;
 pub mod overlay;
-pub mod platform;
 pub mod rich_edit;
 pub mod text;
 pub mod window;
