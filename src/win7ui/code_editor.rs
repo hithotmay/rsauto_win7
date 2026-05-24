@@ -13,8 +13,8 @@ use windows_sys::Win32::{
     UI::{
         Controls::{EM_REPLACESEL, EM_SETSEL, EM_UNDO},
         Input::KeyboardAndMouse::{
-            GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT,
-            VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP, VK_Z,
+            GetAsyncKeyState, GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT,
+            VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP, VK_Y, VK_Z,
         },
         WindowsAndMessaging::*,
     },
@@ -633,7 +633,7 @@ unsafe extern "system" fn script_edit_proc(
     if msg == WM_KEYDOWN && wparam as u32 == VK_Z as u32 {
         let ctrl = GetKeyState(VK_CONTROL as i32) as u16;
         if (ctrl & 0x8000) != 0 {
-            let shift = GetKeyState(VK_SHIFT as i32) as u16;
+            let shift = GetAsyncKeyState(VK_SHIFT as i32) as u16;
             if (shift & 0x8000) != 0 {
                 // Ctrl+Shift+Z → Redo
                 if let Some(prev) = data.redo_stack.pop() {
@@ -657,6 +657,22 @@ unsafe extern "system" fn script_edit_proc(
                 }
                 return 0;
             }
+        }
+    }
+
+    // Ctrl+Y : Redo (alternative to Ctrl+Shift+Z)
+    if msg == WM_KEYDOWN && wparam as u32 == VK_Y as u32 {
+        let ctrl = GetKeyState(VK_CONTROL as i32) as u16;
+        if (ctrl & 0x8000) != 0 {
+            if let Some(prev) = data.redo_stack.pop() {
+                data.undo_stack.push(data.last_snapshot.clone());
+                data.last_snapshot = prev.clone();
+                data.in_undo = true;
+                RichEdit::new(hwnd).set_text(&prev);
+                data.editor.refresh_all();
+                data.in_undo = false;
+            }
+            return 0;
         }
     }
 
