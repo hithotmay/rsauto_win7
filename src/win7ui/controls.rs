@@ -529,6 +529,38 @@ pub unsafe fn tab_get_count(hwnd: HWND) -> i32 {
     SendMessageW(hwnd, TCM_GETITEMCOUNT, 0, 0) as i32
 }
 
+const TCM_DELETEITEM: u32 = 0x1308;
+const TCM_SETITEMW: u32 = 0x133D;
+
+#[repr(C)]
+struct TcItemWForSetText {
+    mask: u32,
+    _dw_state: u32,
+    _dw_state_mask: u32,
+    psz_text: *mut u16,
+    cch_text_max: i32,
+    _i_image: i32,
+    _l_param: isize,
+}
+
+pub unsafe fn tab_delete_item(hwnd: HWND, index: i32) {
+    SendMessageW(hwnd, TCM_DELETEITEM, index as usize, 0);
+}
+
+pub unsafe fn tab_set_item_text(hwnd: HWND, index: i32, text: &str) {
+    let mut wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut item = TcItemWForSetText {
+        mask: TCIF_TEXT,
+        _dw_state: 0,
+        _dw_state_mask: 0,
+        psz_text: wide_text.as_mut_ptr(),
+        cch_text_max: (wide_text.len() + 1) as i32,
+        _i_image: 0,
+        _l_param: 0,
+    };
+    SendMessageW(hwnd, TCM_SETITEMW, index as usize, &mut item as *mut _ as isize);
+}
+
 // ─── 扁平化：禁用控件主题 ──────────────────────────────────
 
 /// 对指定控件调用 SetWindowTheme("", "") 禁用视觉主题，回到经典扁平风格。

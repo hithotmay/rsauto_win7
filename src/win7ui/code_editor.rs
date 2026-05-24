@@ -136,6 +136,17 @@ impl CodeEditor {
         self.clear_error_line();
     }
 
+    pub unsafe fn mark_clean(&self) {
+        if let Some(mut data) = script_data_mut(self.script_hwnd()) {
+            data.saved_snapshot = data.last_snapshot.clone();
+            data.dirty = false;
+        }
+    }
+
+    pub unsafe fn is_dirty(&self) -> bool {
+        script_data(self.script_hwnd()).map(|d| d.dirty).unwrap_or(false)
+    }
+
     pub unsafe fn insert_line_at_end(self, line: &str) {
         insert_line_at_end(self.script_hwnd(), line);
     }
@@ -175,6 +186,8 @@ impl CodeEditor {
                     data.undo_stack.remove(0);
                 }
                 data.last_snapshot = text.clone();
+                // Update dirty state
+                data.dirty = text != data.saved_snapshot;
             }
         }
         let spans = highlight_script_spans(&text);
@@ -257,7 +270,10 @@ struct ScriptSubclassData {
     undo_stack: Vec<String>,
     redo_stack: Vec<String>,
     last_snapshot: String,
+    saved_snapshot: String,
+    dirty: bool,
     in_undo: bool,
+    main_hwnd: HWND,
 }
 
 #[derive(Clone, Copy)]
@@ -272,6 +288,13 @@ unsafe fn subclass_script_editor(hwnd: HWND, editor: CodeEditor) {
     }
     let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, script_edit_proc as *const () as isize);
     let init_text = get_window_text(hwnd);
+    // Walk up parent chain to find the main window (top-level)
+    let mut main_hwnd = editor.parent;
+    let parent = to_hwnd(editor.parent);
+    let ancestor = GetAncestor(parent, GA_ROOT);
+    if !ancestor.is_null() {
+        main_hwnd = ancestor as RawHwnd;
+    }
     let data = Box::new(ScriptSubclassData {
         previous: std::mem::transmute(previous),
         editor,
@@ -279,8 +302,11 @@ unsafe fn subclass_script_editor(hwnd: HWND, editor: CodeEditor) {
         mouse_down: false,
         undo_stack: Vec::new(),
         redo_stack: Vec::new(),
-        last_snapshot: init_text,
+        last_snapshot: init_text.clone(),
+        saved_snapshot: init_text,
+        dirty: false,
         in_undo: false,
+        main_hwnd: to_hwnd(main_hwnd),
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
 }
@@ -643,6 +669,7 @@ unsafe extern "system" fn script_edit_proc(
                     RichEdit::new(hwnd).set_text(&prev);
                     data.editor.refresh_all();
                     data.in_undo = false;
+                    data.dirty = data.last_snapshot != data.saved_snapshot;
                 }
                 return 0;
             } else {
@@ -654,6 +681,7 @@ unsafe extern "system" fn script_edit_proc(
                     RichEdit::new(hwnd).set_text(&prev);
                     data.editor.refresh_all();
                     data.in_undo = false;
+                    data.dirty = data.last_snapshot != data.saved_snapshot;
                 }
                 return 0;
             }
@@ -671,7 +699,18 @@ unsafe extern "system" fn script_edit_proc(
                 RichEdit::new(hwnd).set_text(&prev);
                 data.editor.refresh_all();
                 data.in_undo = false;
+                data.dirty = data.last_snapshot != data.saved_snapshot;
             }
+            return 0;
+        }
+    }
+
+    // Ctrl+W : close current tab
+    if msg == WM_KEYDOWN && (wparam as u32) == ('W' as u32) {
+        let ctrl = GetKeyState(VK_CONTROL as i32) as u16;
+        if (ctrl & 0x8000) != 0 {
+            const IDC_CLOSE_TAB: usize = 151;
+            PostMessageW(data.main_hwnd, WM_COMMAND, IDC_CLOSE_TAB, 0);
             return 0;
         }
     }

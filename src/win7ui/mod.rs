@@ -26,8 +26,8 @@ pub use controls::{
     create_list_box, create_multiline_edit, create_progress_bar, create_single_line_edit,
     create_tab_control, enable_window, hwnd_value, listbox_add_string, listbox_clear,
     listbox_get_selected_index, listbox_get_selected_text, listbox_set_selected, module_handle,
-    progress_get_value, progress_set_range, progress_set_value, tab_get_count, tab_get_selected,
-    tab_insert_item, tab_set_selected, to_hwnd, RawHwnd,
+    progress_get_value, progress_set_range, progress_set_value, tab_delete_item, tab_get_count,
+    tab_get_selected, tab_insert_item, tab_set_item_text, tab_set_selected, to_hwnd, RawHwnd,
 };
 pub use dialogs::choose_file;
 pub use dtt::{DttError, FontDecl, FontSpec, HotKeyDecl, LayoutDecl, Node, NodeKind, Props, UiTree, WindowDecl};

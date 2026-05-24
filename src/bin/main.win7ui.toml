@@ -156,12 +156,24 @@ props = { split_right_width = 480 }
   type = "column"
   layout = { weight = 1 }
 
-    # 编辑器
+    # 编辑器标签页 + 代码编辑器
     [[window.children.children.children]]
-    type = "code_editor"
-    id = 101
+    type = "column"
     layout = { weight = 1 }
-    props = { gutter_width = 48 }
+
+      # 标签栏
+      [[window.children.children.children.children]]
+      type = "tab_control"
+      id = 150
+      layout = { size = [0, 26], margin = [0, 0, 0, 0] }
+      props = { tabs = ["新脚本"] }
+
+      # 编辑器
+      [[window.children.children.children.children]]
+      type = "code_editor"
+      id = 101
+      layout = { weight = 1 }
+      props = { gutter_width = 48 }
 
     # 底部 Group — 快速输入面板
     [[window.children.children.children]]

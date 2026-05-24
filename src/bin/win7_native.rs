@@ -74,6 +74,15 @@ const IDC_TAB_CTRL: i32 = 139;
 const IDC_VAR_VIEW: i32 = 140;
 const IDC_HELP_VIEW: i32 = 141;
 
+const IDC_EDITOR_TABS: i32 = 150;
+const IDC_CLOSE_TAB: i32 = 151;
+
+const MB_YESNOCANCEL: u32 = 0x0003;
+const MB_ICONQUESTION: u32 = 0x0020;
+const IDYES: i32 = 6;
+const IDNO: i32 = 7;
+const IDCANCEL: i32 = 2;
+
 const IDC_CONFIRM_DIR: i32 = 301;
 const IDC_CONFIRM_FILE: i32 = 302;
 const IDC_CONFIRM_THRESHOLD: i32 = 303;
@@ -138,6 +147,12 @@ print(f'你好，x = {x}')
 
 // ─── 应用状态 ───────────────────────────────────────────────
 
+struct EditorTab {
+    path: Option<PathBuf>,
+    content: String,
+    display_name: String,
+}
+
 struct AppState {
     hwnd: isize,
     /// DTT+BTT 构建的控件树（替代所有单独 HWND 字段）
@@ -145,7 +160,8 @@ struct AppState {
     running: bool,
     stop_requested: Option<Arc<AtomicBool>>,
     rx: Option<Receiver<AppEvent>>,
-    current_file: Option<PathBuf>,
+    tabs: Vec<EditorTab>,
+    active_tab: usize,
     capture: Option<CaptureState>,
     confirm: Option<ConfirmState>,
     /// 搜索状态：当前搜索词
@@ -160,7 +176,12 @@ impl Default for AppState {
             running: false,
             stop_requested: None,
             rx: None,
-            current_file: None,
+            tabs: vec![EditorTab {
+                path: None,
+                content: String::new(),
+                display_name: "新脚本".to_string(),
+            }],
+            active_tab: 0,
             capture: None,
             confirm: None,
             search_query: String::new(),
@@ -187,6 +208,16 @@ impl AppState {
     /// 按 ID 获取按钮 HWND
     fn button(&self, id: i32) -> Option<HWND> {
         self.built.as_ref()?.hwnd_by_id(id)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.editor().map(|e| unsafe { e.is_dirty() }).unwrap_or(false)
+    }
+
+    unsafe fn mark_clean(&self) {
+        if let Some(e) = self.editor() {
+            e.mark_clean();
+        }
     }
 }
 
@@ -346,12 +377,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 IDC_CLICK_IMAGE => begin_capture(CaptureMode::ClickImage),
                 IDC_CAPTURE_POINT => begin_capture(CaptureMode::PointClick),
                 IDC_BTN_INSERT => handle_insert_button(),
+                IDC_CLOSE_TAB => close_current_tab(),
                 _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            if confirm_save_if_dirty() {
+                DestroyWindow(hwnd);
             }
             0
         }
         WM_NOTIFY => {
             // TabControl 页面切换
+            let mut editor_tab_switch_target: Option<usize> = None;
             if let Some(app) = APP.get() {
                 let mut app = app.lock().unwrap();
                 if let Some(ref mut built) = app.built {
@@ -370,7 +409,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                             built.switch_tab(IDC_TAB_CTRL, sel);
                         }
                     }
+                    // Editor tab switching — just store the selection, call after releasing lock
+                    if nmhdr.code as u32 == TCN_SELCHANGE && nmhdr.id_from as i32 == IDC_EDITOR_TABS
+                    {
+                        let tab_hwnd = built.hwnd_by_id(IDC_EDITOR_TABS);
+                        if let Some(th) = tab_hwnd {
+                            editor_tab_switch_target = Some(win7ui::tab_get_selected(th) as usize);
+                        }
+                    }
                 }
+            }
+            if let Some(new_sel) = editor_tab_switch_target {
+                switch_editor_tab(new_sel);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -452,6 +502,11 @@ unsafe fn create_controls(hwnd: HWND) {
     if let Some(app) = APP.get() {
         let mut app = app.lock().unwrap();
         app.hwnd = hwnd_value(hwnd);
+
+        // Update initial tab content with sample script
+        if let Some(tab) = app.tabs.first_mut() {
+            tab.content = SAMPLE_SCRIPT.to_string();
+        }
 
         // ── 扁平化：进度条颜色 ──
         if let Some(pb) = built.hwnd_by_id(IDC_PROGRESS) {
@@ -622,13 +677,10 @@ unsafe fn open_script() {
     let Some(path) = choose_script_file(false) else { return; };
     match fs::read_to_string(&path) {
         Ok(text) => {
-            if let Some(app) = APP.get() {
-                let mut app = app.lock().unwrap();
-                let editor = app.editor().unwrap();
-                editor.set_text(&text);
-                app.current_file = Some(path.clone());
-            }
-            refresh_editor_view();
+            let name = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "未命名".to_string());
+            add_editor_tab(name, Some(path.clone()), &text);
             append_log(&format!("已打开脚本：{}", path.display()));
             set_status(&format!("当前脚本：{}", path.display()));
         }
@@ -637,11 +689,17 @@ unsafe fn open_script() {
 }
 
 unsafe fn save_script(force_dialog: bool) {
-    let (text, existing) = {
+    let text = {
         let Some(app) = APP.get() else { return; };
         let app = app.lock().unwrap();
         let editor = app.editor().unwrap();
-        (editor.text(), app.current_file.clone())
+        editor.text()
+    };
+
+    let existing = {
+        let Some(app) = APP.get() else { return; };
+        let app = app.lock().unwrap();
+        app.tabs.get(app.active_tab).and_then(|t| t.path.clone())
     };
 
     let path = if force_dialog {
@@ -651,15 +709,189 @@ unsafe fn save_script(force_dialog: bool) {
     };
 
     let Some(path) = path else { return; };
-    match fs::write(&path, text) {
+    match fs::write(&path, &text) {
         Ok(()) => {
+            let name = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "未命名".to_string());
             if let Some(app) = APP.get() {
-                app.lock().unwrap().current_file = Some(path.clone());
+                let mut app = app.lock().unwrap();
+                let idx = app.active_tab;
+                if let Some(tab) = app.tabs.get_mut(idx) {
+                    tab.path = Some(path.clone());
+                    tab.display_name = name.clone();
+                    tab.content = text;
+                }
+                app.mark_clean();
+                // Update tab label
+                if let Some(built) = &app.built {
+                    if let Some(tab_hwnd) = built.hwnd_by_id(IDC_EDITOR_TABS) {
+                        win7ui::tab_set_item_text(tab_hwnd, idx as i32, &name);
+                    }
+                }
             }
             append_log(&format!("已保存脚本：{}", path.display()));
             set_status(&format!("当前脚本：{}", path.display()));
         }
         Err(err) => append_log(&format!("保存失败：{err}")),
+    }
+}
+
+// ─── 标签管理 ───────────────────────────────────────────────
+
+/// Add a new editor tab, optionally switching to it
+unsafe fn add_editor_tab(name: String, path: Option<PathBuf>, content: &str) {
+    {
+        let Some(app) = APP.get() else { return; };
+        let mut app = app.lock().unwrap();
+        // Save current tab content before switching
+        let cur = app.active_tab;
+        if let Some(editor) = app.editor() {
+            let text = editor.text();
+            if let Some(tab) = app.tabs.get_mut(cur) {
+                tab.content = text;
+            }
+        }
+        let new_idx = app.tabs.len();
+        app.tabs.push(EditorTab {
+            path,
+            content: content.to_string(),
+            display_name: name.clone(),
+        });
+        if let Some(built) = &app.built {
+            if let Some(th) = built.hwnd_by_id(IDC_EDITOR_TABS) {
+                win7ui::tab_insert_item(th, new_idx as i32, &name);
+                win7ui::tab_set_selected(th, new_idx as i32);
+            }
+        }
+        app.active_tab = new_idx;
+    }
+    // Set editor text outside lock
+    if let Some(app) = APP.get() {
+        let app = app.lock().unwrap();
+        if let Some(editor) = app.editor() {
+            editor.set_text(content);
+        }
+        app.mark_clean();
+    }
+    refresh_editor_view();
+}
+
+/// Switch to a different editor tab
+unsafe fn switch_editor_tab(new_idx: usize) {
+    let Some(app_lock) = APP.get() else { return; };
+
+    // Save current editor text to current tab
+    let (content, new_idx) = {
+        let mut app = app_lock.lock().unwrap();
+        if new_idx >= app.tabs.len() || new_idx == app.active_tab {
+            return;
+        }
+        let cur = app.active_tab;
+        if let Some(editor) = app.editor() {
+            let text = editor.text();
+            if let Some(tab) = app.tabs.get_mut(cur) {
+                tab.content = text;
+            }
+        }
+        let content = app.tabs.get(new_idx).map(|t| t.content.clone()).unwrap_or_default();
+        app.active_tab = new_idx;
+        (content, new_idx)
+    };
+
+    // Set editor text outside lock
+    if let Some(app) = APP.get() {
+        let app = app.lock().unwrap();
+        if let Some(editor) = app.editor() {
+            editor.set_text(&content);
+        }
+        app.mark_clean();
+    }
+    refresh_editor_view();
+}
+
+/// Close current editor tab (Ctrl+W or close button)
+unsafe fn close_current_tab() {
+    let Some(app_lock) = APP.get() else { return; };
+
+    // Check dirty
+    {
+        let app = app_lock.lock().unwrap();
+        if app.tabs.len() <= 1 {
+            // Only one tab, don't close
+            return;
+        }
+        if app.is_dirty() {
+            drop(app);
+            // Prompt to save
+            let owner = main_hwnd();
+            let msg = wide("当前文件已修改，是否保存？");
+            let title = wide("关闭标签");
+            let result = MessageBoxW(owner, msg.as_ptr(), title.as_ptr(),
+                MB_YESNOCANCEL | MB_ICONQUESTION);
+            match result {
+                IDYES => {
+                    save_script(false);
+                }
+                IDCANCEL => return,
+                _ => {}
+            }
+        }
+    }
+
+    let switch_to = {
+        let mut app = app_lock.lock().unwrap();
+        if app.tabs.len() <= 1 {
+            return;
+        }
+        let remove_idx = app.active_tab;
+        let switch_to = if remove_idx >= app.tabs.len() - 1 {
+            remove_idx - 1
+        } else {
+            remove_idx + 1
+        };
+        let content = app.tabs.get(switch_to).map(|t| t.content.clone()).unwrap_or_default();
+        if let Some(editor) = app.editor() {
+            editor.set_text(&content);
+        }
+        if let Some(built) = &app.built {
+            if let Some(tab_hwnd) = built.hwnd_by_id(IDC_EDITOR_TABS) {
+                win7ui::tab_delete_item(tab_hwnd, remove_idx as i32);
+                win7ui::tab_set_selected(tab_hwnd, switch_to as i32);
+            }
+        }
+        app.tabs.remove(remove_idx);
+        app.active_tab = if switch_to > remove_idx {
+            switch_to - 1
+        } else {
+            switch_to
+        };
+        app.mark_clean();
+    };
+    refresh_editor_view();
+}
+
+/// Check if current tab is dirty and prompt to save.
+/// Returns true if we should proceed (user saved or chose not to),
+/// false if user cancelled.
+unsafe fn confirm_save_if_dirty() -> bool {
+    let Some(app) = APP.get() else { return true; };
+    let dirty = app.lock().unwrap().is_dirty();
+    if !dirty {
+        return true;
+    }
+    let owner = main_hwnd();
+    let msg = wide("文件已修改，是否保存？");
+    let title = wide("关闭窗口");
+    let result = MessageBoxW(owner, msg.as_ptr(), title.as_ptr(),
+        MB_YESNOCANCEL | MB_ICONQUESTION);
+    match result {
+        IDYES => {
+            save_script(false);
+            true
+        }
+        IDNO => true,
+        _ => false, // IDCANCEL
     }
 }
 
