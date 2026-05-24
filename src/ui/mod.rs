@@ -4,6 +4,7 @@
 //! must implement. The application logic only depends on these traits,
 //! never on platform-specific types like HWND.
 
+pub mod app_common;
 pub mod dtt;
 
 // ─── Platform-agnostic handle types ────────────────────────

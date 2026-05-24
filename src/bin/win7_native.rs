@@ -47,36 +47,14 @@ const ES_AUTOHSCROLL: u32 = 0x0080;
 // 默认 gutter 宽度
 const DEFAULT_GUTTER_WIDTH: i32 = 48;
 
-// ─── 控件 ID（与 TOML 定义一一对应）──────────────────────────
-const IDC_SCRIPT: i32 = 101;
-const IDC_LOG: i32 = 102;
-const IDC_RUN: i32 = 103;
-const IDC_STOP: i32 = 104;
-const IDC_OPEN: i32 = 105;
-const IDC_SAVE: i32 = 106;
-const IDC_SAVE_AS: i32 = 107;
-const IDC_CAPTURE: i32 = 108;
-const IDC_CLICK_IMAGE: i32 = 109;
-const IDC_CAPTURE_POINT: i32 = 110;
-const IDC_STATUS: i32 = 120;
+// ─── 控件 ID（跨平台共享）──────────────────────────────────
+use common::{IDC_SCRIPT, IDC_LOG, IDC_RUN, IDC_STOP, IDC_OPEN, IDC_SAVE, IDC_SAVE_AS};
+use common::{IDC_CAPTURE, IDC_CLICK_IMAGE, IDC_CAPTURE_POINT, IDC_STATUS};
 
-// 新增控件 ID（全控件验证）
-const IDC_COMBO_LANG: i32 = 130;
-const IDC_EDIT_SEARCH: i32 = 131;
-const IDC_PROGRESS: i32 = 132;
-const IDC_CHECK_WRAP: i32 = 133;
-const IDC_CHECK_LINENO: i32 = 134;
-const IDC_EDIT_INSERT: i32 = 135;
-const IDC_BTN_INSERT: i32 = 136;
-const IDC_MULTILINE: i32 = 137;
-const IDC_LIST_SNIPPETS: i32 = 138;
-const IDC_TAB_CTRL: i32 = 139;
-const IDC_VAR_VIEW: i32 = 140;
-const IDC_HELP_VIEW: i32 = 141;
+use common::{IDC_COMBO_LANG, IDC_EDIT_SEARCH, IDC_PROGRESS, IDC_CHECK_WRAP, IDC_CHECK_LINENO};
+use common::{IDC_EDIT_INSERT, IDC_BTN_INSERT, IDC_MULTILINE, IDC_LIST_SNIPPETS, IDC_TAB_CTRL, IDC_VAR_VIEW, IDC_HELP_VIEW};
 
-const IDC_EDITOR_TABS: i32 = 150;
-const IDC_CLOSE_TAB: i32 = 151;
-const IDC_OPEN_WORKDIR: i32 = 152;
+use common::{IDC_EDITOR_TABS, IDC_CLOSE_TAB, IDC_OPEN_WORKDIR};
 
 const MB_YESNOCANCEL: u32 = 0x0003;
 const MB_ICONQUESTION: u32 = 0x0020;
@@ -98,9 +76,7 @@ const HOTKEY_SEARCH_NEXT: i32 = 203;
 const VK_F3: u32 = 0x72;
 const VK_F5: u32 = 0x74;
 const VK_F11: u32 = 0x7A;
-const MAX_LOG_CHARS: i32 = 80_000;
-const MAX_RUN_LOG_LINES: usize = 1000;
-const LOG_SNAPSHOT_INTERVAL_MS: u64 = 160;
+use common::{MAX_LOG_CHARS, MAX_RUN_LOG_LINES, LOG_SNAPSHOT_INTERVAL_MS};
 const RUN_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_RUN, VK_F5);
 const STOP_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_STOP, VK_F11);
 const SEARCH_NEXT_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_SEARCH_NEXT, VK_F3);
@@ -124,35 +100,13 @@ unsafe fn init_flat_brushes() {
 /// 嵌入式 UI 定义（编译时绑定，零外部文件依赖）
 const UI_TOML: &str = include_str!("main.win7ui.toml");
 
-const SAMPLE_SCRIPT: &str = r#"# Win7 原生模式：无 OpenGL，支持中文
-x = 1
-print(f'你好，x = {x}')
-
-# Python 风格语法示例：
-# def hello(name):
-#     local_x = int("2") + 3
-#     print(f'{name}: {local_x:.2f}, type={type(local_x)}')
-# hello("测试")
-#
-# for i in range(10):
-#     if i == 3:
-#         continue
-#     if i == 8:
-#         break
-#     print(i)
-#
-# click(500, 300)
-# sleep(500)
-# find_click("captures/click_image.png", 0.92, 3000)
-"#;
+use common::SAMPLE_SCRIPT;
 
 // ─── 应用状态 ───────────────────────────────────────────────
 
-struct EditorTab {
-    path: Option<PathBuf>,
-    content: String,
-    display_name: String,
-}
+use pyauto_rs::ui::app_common::{
+    self as common, AppEvent, CaptureMode, CapturedScreen, EditorTab, ImageRect,
+};
 
 struct AppState {
     hwnd: isize,
@@ -225,12 +179,6 @@ impl AppState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CaptureMode {
-    SaveRegion,
-    ClickImage,
-    PointClick,
-}
 
 struct CaptureState {
     mode: CaptureMode,
@@ -254,39 +202,8 @@ struct ConfirmState {
     timeout_edit: isize,
 }
 
-#[derive(Clone, Copy)]
-struct ImageRect {
-    left: u32,
-    top: u32,
-    width: u32,
-    height: u32,
-}
 
-struct CapturedScreen {
-    screen_x: i32,
-    screen_y: i32,
-    width: i32,
-    height: i32,
-    image: RgbaImage,
-}
 
-enum AppEvent {
-    ReplaceLog {
-        lines: Vec<String>,
-        total_lines: usize,
-    },
-    Done {
-        status: String,
-        error_line: Option<usize>,
-    },
-    CaptureReady {
-        mode: CaptureMode,
-        result: Result<CapturedScreen, String>,
-    },
-    VarsUpdate {
-        vars: Vec<(String, String)>,
-    },
-}
 
 // Safety: AppState is only accessed from the UI thread (via Mutex inside AppStore).
 // HWND/isize values are Win32 handles, safe to move across threads as opaque integers.
@@ -607,7 +524,7 @@ unsafe fn start_script() {
                 if log_stop.load(Ordering::Relaxed) {
                     return;
                 }
-                push_tail_log(&mut tail_logs, &mut total_lines, msg);
+                common::push_tail_log(&mut tail_logs, &mut total_lines, msg);
 
                 if last_flush.elapsed() >= Duration::from_millis(LOG_SNAPSHOT_INTERVAL_MS) {
                     send_log_snapshot(&tx, &tail_logs, total_lines);
@@ -622,13 +539,16 @@ unsafe fn start_script() {
             })?;
             Ok(())
         });
-        let error_line = result.as_ref().err().and_then(run_error_line);
+        let error_line = result.as_ref().err().and_then(|err| match err {
+            RunError::Line { line, .. } => Some(*line),
+            _ => None,
+        });
         let (final_line, status) = match result {
             Ok(()) => ("运行完成。".to_string(), "运行完成。"),
             Err(RunError::Stopped) => ("运行已停止。".to_string(), "运行已停止。"),
             Err(err) => (format!("错误：{err}"), "运行出错。"),
         };
-        push_tail_log(&mut tail_logs, &mut total_lines, final_line);
+        common::push_tail_log(&mut tail_logs, &mut total_lines, final_line);
         send_log_snapshot(&tx, &tail_logs, total_lines);
         let _ = tx.send(AppEvent::Done {
             status: status.to_string(),
@@ -665,20 +585,7 @@ fn send_log_snapshot(
     unsafe { tx.wake(); }
 }
 
-fn push_tail_log(tail_logs: &mut VecDeque<String>, total_lines: &mut usize, line: String) {
-    *total_lines += 1;
-    if tail_logs.len() >= MAX_RUN_LOG_LINES {
-        tail_logs.pop_front();
-    }
-    tail_logs.push_back(line);
-}
 
-fn run_error_line(err: &RunError) -> Option<usize> {
-    match err {
-        RunError::Line { line, .. } => Some(*line),
-        _ => None,
-    }
-}
 
 // ─── 文件操作 ───────────────────────────────────────────────
 
@@ -1219,7 +1126,7 @@ unsafe fn create_confirm_controls(hwnd: HWND) {
         };
         (
             capture.mode,
-            format!("{prefix}_{}.png", timestamp_for_file()),
+            format!("{prefix}_{}.png", common::timestamp_for_file()),
             format!("选区：{} x {}", selected.width, selected.height),
         )
     };
@@ -1315,7 +1222,7 @@ unsafe fn confirm_capture() {
         )
     };
 
-    match save_crop(&image, selected, &path) {
+    match common::save_crop(&image, selected, &path) {
         Ok(()) => {
             append_log(&format!("已保存图片：{}", path.display()));
             if mode == CaptureMode::ClickImage {
@@ -1339,15 +1246,6 @@ unsafe fn confirm_capture() {
     }
 }
 
-fn save_crop(image: &RgbaImage, selected: ImageRect, path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-        }
-    }
-    let cropped = imageops::crop_imm(image, selected.left, selected.top, selected.width, selected.height).to_image();
-    cropped.save(path).map_err(|err| err.to_string())
-}
 
 unsafe fn reselect_capture() {
     let (confirm_hwnd, overlay_data) = {
@@ -1824,12 +1722,6 @@ unsafe fn main_hwnd() -> HWND {
         .unwrap_or(null_mut())
 }
 
-fn timestamp_for_file() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
-}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
