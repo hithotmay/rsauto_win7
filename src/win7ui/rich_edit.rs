@@ -431,6 +431,51 @@ impl RichEdit {
         self.finish_redraw();
     }
 
+    /// Apply highlights only to a specific region [region_start, region_end).
+    /// This resets the region to default color first, then applies spans.
+    /// Much faster than full-document highlight for large files.
+    pub unsafe fn apply_highlights_region(
+        self,
+        region_start: usize,
+        region_end: usize,
+        text_len: usize,
+        spans: &[HighlightSpan],
+        default_color: u32,
+    ) {
+        if self.hwnd.is_null() {
+            return;
+        }
+
+        let scroll_pos = self.save_scroll_pos();
+        let mut original = CharRange {
+            cp_min: 0,
+            cp_max: 0,
+        };
+        SendMessageW(
+            self.hwnd,
+            EM_EXGETSEL,
+            0,
+            &mut original as *mut CharRange as LPARAM,
+        );
+        SendMessageW(self.hwnd, WM_SETREDRAW, 0, 0);
+        // Reset only the visible region to default color
+        self.apply_color(region_start, region_end, default_color);
+        // Apply spans (already filtered to visible region)
+        for span in spans {
+            self.apply_color(span.start, span.end, span.color);
+        }
+        // Restore selection + scroll position
+        SendMessageW(
+            self.hwnd,
+            EM_EXSETSEL,
+            0,
+            &mut original as *mut CharRange as LPARAM,
+        );
+        self.restore_scroll_pos(scroll_pos);
+        SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
+        self.finish_redraw();
+    }
+
     pub unsafe fn apply_line_markers(
         self,
         text_len: usize,

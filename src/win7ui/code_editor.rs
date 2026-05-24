@@ -36,7 +36,7 @@ const GUTTER_TIMER_BASE: usize = 20_000;
 const HIGHLIGHT_TIMER_BASE: usize = 30_000;
 const MARK_TIMER_BASE: usize = 40_000;
 const GUTTER_WHEEL_SYNC_MS: u32 = 45;
-const HIGHLIGHT_SYNC_MS: u32 = 90;
+const HIGHLIGHT_SYNC_MS: u32 = 200;
 const MARK_SYNC_MS: u32 = 35;
 const EM_LINESCROLL: u32 = 0x00B6;
 const EM_EXGETSEL: u32 = 0x0400 + 52;
@@ -190,8 +190,48 @@ impl CodeEditor {
                 data.dirty = text != data.saved_snapshot;
             }
         }
-        let spans = highlight_script_spans(&text);
-        RichEdit::new(script).apply_highlights(rich_edit_text_units(&text), &spans, color_default());
+
+        // Skip re-highlight if text hasn't changed since last highlight
+        let needs_highlight = script_data(script)
+            .map(|d| d.last_highlight_text != text)
+            .unwrap_or(true);
+        if !needs_highlight {
+            self.refresh_marks();
+            return;
+        }
+
+        let rich_edit = RichEdit::new(script);
+        let text_units = rich_edit_text_units(&text);
+
+        // For large files (>500 lines), only apply highlights to visible region
+        let line_count = rich_edit.line_count();
+        let first_visible = rich_edit.first_visible_line();
+        let visible_margin = 80;
+
+        if line_count > 500 {
+            // Parse full text for spans, but only apply colors to visible region
+            let full_spans = highlight_script_spans(&text);
+            let first_hl_line = first_visible.saturating_sub(visible_margin);
+            let last_hl_line = (first_visible + visible_margin * 2).min(line_count);
+            let vis_start = SendMessageW(script, EM_LINEINDEX, first_hl_line, 0).max(0) as usize;
+            let vis_end_char = SendMessageW(script, EM_LINEINDEX, last_hl_line, 0);
+            let vis_end = if vis_end_char >= 0 { vis_end_char as usize } else { text_units };
+
+            // Filter spans to visible region
+            let vis_spans: Vec<HighlightSpan> = full_spans.into_iter()
+                .filter(|s| s.end > vis_start && s.start < vis_end)
+                .collect();
+            rich_edit.apply_highlights_region(vis_start, vis_end, text_units, &vis_spans, color_default());
+        } else {
+            // Small file: full highlight
+            let spans = highlight_script_spans(&text);
+            rich_edit.apply_highlights(text_units, &spans, color_default());
+        }
+
+        // Store highlighted text
+        if let Some(data) = script_data_mut(script) {
+            data.last_highlight_text = text;
+        }
         self.refresh_marks();
     }
 
@@ -274,6 +314,8 @@ struct ScriptSubclassData {
     dirty: bool,
     in_undo: bool,
     main_hwnd: HWND,
+    /// Text content at last highlight — used to skip re-highlight when unchanged
+    last_highlight_text: String,
 }
 
 #[derive(Clone, Copy)]
@@ -307,6 +349,7 @@ unsafe fn subclass_script_editor(hwnd: HWND, editor: CodeEditor) {
         dirty: false,
         in_undo: false,
         main_hwnd: to_hwnd(main_hwnd),
+        last_highlight_text: String::new(),
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
 }
@@ -733,6 +776,7 @@ unsafe extern "system" fn script_edit_proc(
                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_NOCHILDREN,
             );
         }
+        schedule_editor_highlight(data.editor);
         return 0;
     }
 
@@ -776,6 +820,8 @@ unsafe extern "system" fn script_edit_proc(
                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_NOCHILDREN,
             );
         }
+        // Scrolling reveals new lines — re-highlight visible region
+        schedule_editor_highlight(data.editor);
         // 拖选过程中的 WM_VSCROLL 不触发 mark refresh，避免回弹
         let is_mouse_down = script_data(hwnd).map_or(false, |d| d.mouse_down);
         if !is_mouse_down {
