@@ -721,6 +721,18 @@ impl Ui {
         Ok(built)
     }
 
+    /// 从已解析的 UiTree 构建 UI（跨平台入口）
+    ///
+    /// # Safety
+    /// parent 必须是有效 HWND
+    pub unsafe fn from_tree(
+        tree: &crate::ui::dtt::UiTree,
+        parent: HWND,
+    ) -> Result<BuiltTree, Box<dyn std::error::Error>> {
+        let built = build(tree, parent, &BuildOptions::default())?;
+        Ok(built)
+    }
+
     /// 从 .win7ui.toml 文件构建 UI
     ///
     /// # Safety

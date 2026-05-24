@@ -48,10 +48,18 @@ impl UiBackend for Win32Backend {
 
     type EventSender<T: Send + 'static> = UiEventSender<T>;
 
-    fn build_ui(_toml: &str) -> Result<Self::BuiltUi, String> {
-        // TODO: parse TOML and call BTT builder
-        // For now, Win32BuiltUi wraps a pre-built BuiltTree
-        Err("use Win32BuiltUi::from_built_tree() instead".into())
+    fn build_from_tree(tree: &crate::ui::dtt::UiTree) -> Result<Self::BuiltUi, String> {
+        // Win32 BTT needs an HWND parent — use the desktop window.
+        // In practice, the main window is created first via create_main_window(),
+        // then BTT builds into it. This entry point exists for future use.
+        Err("Win32 requires HWND parent; use BuiltTree::from_tree(tree, hwnd) instead".into())
+    }
+
+    fn build_ui(toml: &str) -> Result<Self::BuiltUi, String> {
+        // BTT has its own TOML→BuiltTree path with HWND creation.
+        // Use build_from_tree after creating the tree manually.
+        let tree: crate::ui::dtt::UiTree = toml::from_str(toml).map_err(|e| format!("TOML: {e}"))?;
+        Self::build_from_tree(&tree)
     }
 
     fn run_message_loop() {
@@ -142,6 +150,12 @@ impl BuiltUi for Win32BuiltUi {
 
     fn search_by_id(&self, id: i32) -> Option<HwndSearchEdit> {
         self.inner.hwnd_by_id(id).map(HwndSearchEdit)
+    }
+
+    fn has_widget(&self, id: i32) -> bool {
+        self.inner.hwnd_by_id(id).is_some()
+            || self.inner.code_editor_by_id(id).is_some()
+            || self.inner.log_view_by_id(id).is_some()
     }
 
     fn on_resize(&mut self, width: i32, height: i32) {

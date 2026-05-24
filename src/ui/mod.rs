@@ -3,16 +3,34 @@
 //! Defines traits that each platform backend (win7ui, linux-egui, etc.)
 //! must implement. The application logic only depends on these traits,
 //! never on platform-specific types like HWND.
+//!
+//! The entry point is `UiBackend::build_ui(&UiTree)` — every backend
+//! consumes the same DTT description and produces its own widget tree.
+
+use std::path::PathBuf;
+
+use self::dtt::UiTree;
 
 pub mod app_common;
 pub mod app_logic;
 pub mod dtt;
 
-use std::path::PathBuf;
+// ─── Event sender ──────────────────────────────────────────
 
-// ─── Backend trait ──────────────────────────────────────────
+/// Abstraction for sending events from background threads to the UI thread.
+pub trait EventSender<T>: Clone + Send + Sync {
+    fn send(&self, event: T) -> Result<(), std::sync::mpsc::SendError<T>>;
+    /// Wake the UI thread (post a message / request redraw).
+    fn wake(&self);
+}
+
+// ─── UiBackend ─────────────────────────────────────────────
 
 /// A complete UI backend. Each platform implements this.
+///
+/// Call `build_ui(&UiTree)` to construct the widget tree from a
+/// platform-neutral DTT description. The returned `BuiltUi` provides
+/// access to individual widgets by their declared `id`.
 pub trait UiBackend: Sized + 'static {
     type BuiltUi: BuiltUi;
     type Editor: Editor;
@@ -27,8 +45,22 @@ pub trait UiBackend: Sized + 'static {
     /// Event sender type for cross-thread communication.
     type EventSender<T: Send + 'static>: EventSender<T>;
 
-    /// Build the UI from a DTT TOML string.
-    fn build_ui(toml: &str) -> Result<Self::BuiltUi, String>;
+    /// Build the UI from a parsed `UiTree`.
+    ///
+    /// Each backend interprets the same DTT tree with its own widgets:
+    /// - Win32: creates HWND controls via BTT
+    /// - egui: creates egui widgets
+    /// - iced: creates iced widgets
+    fn build_from_tree(tree: &UiTree) -> Result<Self::BuiltUi, String>;
+
+    /// Parse a TOML string and build the UI.
+    ///
+    /// Convenience wrapper that parses TOML → UiTree → build_from_tree.
+    fn build_ui(toml: &str) -> Result<Self::BuiltUi, String> {
+        let tree: UiTree = toml::from_str(toml).map_err(|e| format!("TOML parse error: {e}"))?;
+        tree.validate().map_err(|e| format!("DTT validation: {e}"))?;
+        Self::build_from_tree(&tree)
+    }
 
     /// Run the platform message loop. Blocks until the app exits.
     fn run_message_loop();
@@ -40,9 +72,11 @@ pub trait UiBackend: Sized + 'static {
     fn choose_file(save: bool, filter: &str, title: &str, default_ext: &str) -> Option<PathBuf>;
 }
 
-// ─── Built UI ───────────────────────────────────────────────
+// ─── Built UI ──────────────────────────────────────────────
 
 /// The tree of built widgets produced by `UiBackend::build_ui`.
+///
+/// Provides widget lookup by the `id` declared in DTT TOML.
 pub trait BuiltUi {
     type Backend: UiBackend;
 
@@ -55,6 +89,9 @@ pub trait BuiltUi {
     fn progress_by_id(&self, id: i32) -> Option<<Self::Backend as UiBackend>::ProgressBar>;
     fn search_by_id(&self, id: i32) -> Option<<Self::Backend as UiBackend>::SearchEdit>;
 
+    /// Generic widget lookup — returns true if any widget exists with this id.
+    fn has_widget(&self, id: i32) -> bool;
+
     /// Handle window resize.
     fn on_resize(&mut self, width: i32, height: i32);
 
@@ -62,7 +99,7 @@ pub trait BuiltUi {
     fn switch_tab(&mut self, tab_id: i32, page_index: usize);
 }
 
-// ─── Widget traits ──────────────────────────────────────────
+// ─── Widget traits ─────────────────────────────────────────
 
 /// Code editor widget (RichEdit on Win32, multi-line text on Linux).
 pub trait Editor: Clone {
@@ -85,7 +122,7 @@ pub trait LogView: Clone {
     fn set_max_chars(&self, max: i32);
 }
 
-/// Tab control.
+/// Tab control (multiple pages).
 pub trait TabControl: Clone {
     fn insert_item(&self, index: i32, label: &str);
     fn delete_item(&self, index: i32);
@@ -95,7 +132,7 @@ pub trait TabControl: Clone {
     fn count(&self) -> i32;
 }
 
-/// Status bar label.
+/// Status bar.
 pub trait StatusBar: Clone {
     fn set_text(&self, text: &str);
 }
@@ -116,43 +153,8 @@ pub trait ProgressBar: Clone {
     fn set_value(&self, value: i32);
 }
 
-/// Single-line search text input.
+/// Search/edit single-line input.
 pub trait SearchEdit: Clone {
     fn text(&self) -> String;
     fn set_text(&self, text: &str);
-}
-
-// ─── Event sender ───────────────────────────────────────────
-
-/// Sends events from background threads to the UI thread.
-pub trait EventSender<T: Send + 'static>: Clone + Send + Sync {
-    fn send(&self, event: T) -> Result<(), std::sync::mpsc::SendError<T>>;
-    fn wake(&self);
-}
-
-// ─── Application state (generic over backend) ───────────────
-
-/// Generic application state, parameterized by the UI backend.
-pub struct AppContext<B: UiBackend> {
-    pub built: Option<B::BuiltUi>,
-    pub running: bool,
-    pub stop_requested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    pub tabs: Vec<app_common::EditorTab>,
-    pub active_tab: usize,
-    pub search_query: String,
-    pub work_dir: std::path::PathBuf,
-}
-
-impl<B: UiBackend> Default for AppContext<B> {
-    fn default() -> Self {
-        Self {
-            built: None,
-            running: false,
-            stop_requested: None,
-            tabs: vec![app_common::EditorTab::new("新脚本")],
-            active_tab: 0,
-            search_query: String::new(),
-            work_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        }
-    }
 }
