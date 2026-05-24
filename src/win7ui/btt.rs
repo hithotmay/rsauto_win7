@@ -60,6 +60,8 @@ pub struct BuiltTree {
     /// 字体句柄
     pub ui_font: isize,
     pub fixed_font: isize,
+    /// 动态 gutter 宽度覆盖（CodeEditor id -> gutter_width）
+    editor_gutter_widths: HashMap<i32, i32>,
 }
 
 /// BuiltNode 的轻量引用（用于 id_map）
@@ -94,7 +96,25 @@ impl BuiltTree {
 
     /// 窗口尺寸变化时重新计算布局
     pub fn on_resize(&mut self, client_w: i32, client_h: i32) {
-        layout_children(&mut self.root_children, 0, 0, client_w, client_h);
+        layout_children(
+            &mut self.root_children,
+            0,
+            0,
+            client_w,
+            client_h,
+            &self.editor_gutter_widths,
+        );
+    }
+
+    /// 动态设置某个 CodeEditor 的 gutter 宽度（用于行号开关）
+    /// 调用后需触发 on_resize 或手动 layout 才能生效
+    pub fn set_editor_gutter_width(&mut self, editor_id: i32, width: i32) {
+        self.editor_gutter_widths.insert(editor_id, width);
+    }
+
+    /// 获取某个 CodeEditor 当前的 gutter 宽度（含动态覆盖）
+    pub fn editor_gutter_width(&self, editor_id: i32, default_width: i32) -> i32 {
+        self.editor_gutter_widths.get(&editor_id).copied().unwrap_or(default_width)
     }
 
     /// 切换 TabControl 的活动页面
@@ -163,7 +183,17 @@ pub unsafe fn build(
     let log_hwnds: Vec<HWND> = collect_log_view_hwnds(&built_children);
     font::apply_font_handle_to_many(&log_hwnds, fixed_font);
 
-    // TabControl 页面管理：初始只显示第一个 tab 页面
+    // RichEdit 控件需要 EM_SETCHARFORMAT 同步字体（WM_SETFONT 不够）
+    // 对所有 RichEdit 控件同步字体，确保初始化/插入/粘贴字体一致
+    {
+        let rich_edits = collect_rich_edit_hwnds(&built_children);
+        for re_hwnd in &rich_edits {
+            // CodeEditor uses fixed_font, LogView uses fixed_font too
+            unsafe {
+                RichEdit::new(*re_hwnd).sync_font(fixed_font);
+            }
+        }
+    }
     init_tab_pages(&built_children);
 
     Ok(BuiltTree {
@@ -172,6 +202,7 @@ pub unsafe fn build(
         id_map,
         ui_font,
         fixed_font,
+        editor_gutter_widths: HashMap::new(),
     })
 }
 
@@ -269,7 +300,8 @@ unsafe fn build_node(
         NodeKind::LogView => {
             let id = ctrl_id.unwrap_or(0);
             let re = RichEdit::create(parent, &node.text, id, 0, 0, 400, 200);
-            let lv = LogView::new(re.hwnd(), node.props.log_max_chars);
+            let mut lv = LogView::new(re.hwnd(), node.props.log_max_chars);
+            lv.set_font(fixed_font as isize);
             (Some(re.hwnd()), None, Some(lv))
         }
         // GroupBox 容器——创建 BS_GROUPBOX 视觉边框
@@ -290,9 +322,12 @@ unsafe fn build_node(
         }
     };
 
-    // ── 扁平化：对所有创建出来的控件禁用视觉主题 ──
+    // ── 扁平化：对普通控件禁用视觉主题，但保留 RichEdit 滚动条主题 ──
+    // RichEdit（编辑器、日志框）的滚动条依赖系统主题绘制，去掉后变经典灰色不好看
     if let Some(h) = hwnd {
-        ctrl::set_flat_theme(h);
+        if !matches!(node.kind, NodeKind::CodeEditor | NodeKind::LogView) {
+            ctrl::set_flat_theme(h);
+        }
     }
 
     // 注册 ID 查找表
@@ -348,6 +383,7 @@ fn layout_children_impl(
     children: &mut [BuiltNode],
     x: i32, y: i32, w: i32, h: i32,
     vertical_override: Option<bool>,
+    gutter_overrides: &HashMap<i32, i32>,
 ) {
     if children.is_empty() || w <= 0 || h <= 0 {
         return;
@@ -359,7 +395,7 @@ fn layout_children_impl(
         for child in children {
             let (cx, cy) = child.layout.pos.unwrap();
             let (cw, ch) = child.layout.size.unwrap_or((w, h));
-            apply_node_position(child, x + cx, y + cy, cw, ch);
+            apply_node_position(child, x + cx, y + cy, cw, ch, gutter_overrides);
         }
         return;
     }
@@ -372,15 +408,15 @@ fn layout_children_impl(
     let vertical = vertical_override.unwrap_or(true);
 
     if has_weights {
-        layout_weighted(children, x, y, w, h, vertical, total_weight);
+        layout_weighted(children, x, y, w, h, vertical, total_weight, gutter_overrides);
     } else {
-        layout_fixed(children, x, y, w, h, vertical);
+        layout_fixed(children, x, y, w, h, vertical, gutter_overrides);
     }
 }
 
 /// 公开入口：根级布局，自动垂直
-fn layout_children(children: &mut [BuiltNode], x: i32, y: i32, w: i32, h: i32) {
-    layout_children_impl(children, x, y, w, h, None);
+fn layout_children(children: &mut [BuiltNode], x: i32, y: i32, w: i32, h: i32, gutter_overrides: &HashMap<i32, i32>) {
+    layout_children_impl(children, x, y, w, h, None, gutter_overrides);
 }
 
 /// 按权重弹性分配空间
@@ -389,7 +425,19 @@ fn layout_weighted(
     x: i32, y: i32, w: i32, h: i32,
     vertical: bool,
     total_weight: i32,
+    gutter_overrides: &HashMap<i32, i32>,
 ) {
+    // 先算出 fixed-size 子节点占用的空间，剩余空间按 weight 分配
+    let fixed_total: i32 = children.iter()
+        .filter(|c| c.layout.weight == 0)
+        .map(|c| {
+            let (fw, fh) = c.layout.size.unwrap_or((0, 0));
+            if vertical { fh.max(20) } else { fw.max(20) }
+        })
+        .sum();
+    let remain_v = (h - fixed_total).max(0);
+    let remain_h = (w - fixed_total).max(0);
+
     let mut offset = 0;
     for child in children {
         let (fixed_w, fixed_h) = child.layout.size.unwrap_or((0, 0));
@@ -397,7 +445,7 @@ fn layout_weighted(
 
         let (cw, ch, cx, cy) = if vertical {
             let ch = if weight > 0 && total_weight > 0 {
-                (h as f64 * weight as f64 / total_weight as f64) as i32
+                (remain_v as f64 * weight as f64 / total_weight as f64) as i32
             } else {
                 fixed_h.max(20)
             };
@@ -407,7 +455,7 @@ fn layout_weighted(
             (cw, ch, cx, cy)
         } else {
             let cw = if weight > 0 && total_weight > 0 {
-                (w as f64 * weight as f64 / total_weight as f64) as i32
+                (remain_h as f64 * weight as f64 / total_weight as f64) as i32
             } else {
                 fixed_w.max(20)
             };
@@ -417,7 +465,7 @@ fn layout_weighted(
             (cw, ch, cx, cy)
         };
 
-        apply_node_position(child, x + cx, y + cy, cw, ch);
+        apply_node_position(child, x + cx, y + cy, cw, ch, gutter_overrides);
 
         if vertical {
             offset += ch;
@@ -432,6 +480,7 @@ fn layout_fixed(
     children: &mut [BuiltNode],
     x: i32, y: i32, w: i32, h: i32,
     vertical: bool,
+    gutter_overrides: &HashMap<i32, i32>,
 ) {
     let mut offset = 0;
     for child in children {
@@ -451,7 +500,7 @@ fn layout_fixed(
             (cw, ch, offset, 0)
         };
 
-        apply_node_position(child, x + cx, y + cy, cw, ch);
+        apply_node_position(child, x + cx, y + cy, cw, ch, gutter_overrides);
 
         if vertical {
             offset += ch;
@@ -462,7 +511,7 @@ fn layout_fixed(
 }
 
 /// 将计算好的位置应用到节点（及其子节点）
-fn apply_node_position(node: &mut BuiltNode, x: i32, y: i32, w: i32, h: i32) {
+fn apply_node_position(node: &mut BuiltNode, x: i32, y: i32, w: i32, h: i32, gutter_overrides: &HashMap<i32, i32>) {
     // 应用 margin
     let margin = &node.layout.margin;
     let (mt, mr, mb, ml) = if margin.len() == 4 {
@@ -486,22 +535,22 @@ fn apply_node_position(node: &mut BuiltNode, x: i32, y: i32, w: i32, h: i32) {
     // 容器类型需要递归布局子控件
     match &node.kind {
         NodeKind::Row => {
-            layout_children_impl(&mut node.children, x, y, w, h, Some(false));
+            layout_children_impl(&mut node.children, x, y, w, h, Some(false), gutter_overrides);
         }
         NodeKind::Column => {
-            layout_children_impl(&mut node.children, x, y, w, h, Some(true));
+            layout_children_impl(&mut node.children, x, y, w, h, Some(true), gutter_overrides);
         }
         NodeKind::Split => {
             let right_w = node.props.split_right_width;
             let gap: i32 = 2; // 编辑器和输出框之间的间距
             let left_w = (w - right_w - gap).max(0);
             if node.children.len() == 2 {
-                apply_node_position(&mut node.children[0], x, y, left_w, h);
-                apply_node_position(&mut node.children[1], x + left_w + gap, y, right_w, h);
+                apply_node_position(&mut node.children[0], x, y, left_w, h, gutter_overrides);
+                apply_node_position(&mut node.children[1], x + left_w + gap, y, right_w, h, gutter_overrides);
             }
         }
         NodeKind::Group => {
-            layout_children_impl(&mut node.children, x, y, w, h, None);
+            layout_children_impl(&mut node.children, x, y, w, h, None, gutter_overrides);
         }
         NodeKind::TabControl => {
             // Tab 页面子节点全部叠加在 tab 显示区域
@@ -510,12 +559,16 @@ fn apply_node_position(node: &mut BuiltNode, x: i32, y: i32, w: i32, h: i32) {
             let page_y = y + tab_header_h;
             let page_h = (h - tab_header_h).max(0);
             for child in &mut node.children {
-                apply_node_position(child, x, page_y, w, page_h);
+                apply_node_position(child, x, page_y, w, page_h, gutter_overrides);
             }
         }
         NodeKind::CodeEditor => {
             if let Some(ref ce) = node.code_editor {
-                unsafe { ce.layout(x, y, w, h, node.props.gutter_width.unwrap_or(48)); }
+                let default_gw = node.props.gutter_width.unwrap_or(48);
+                let gw = node.id
+                    .and_then(|id| gutter_overrides.get(&id).copied())
+                    .unwrap_or(default_gw);
+                unsafe { ce.layout(x, y, w, h, gw); }
             }
         }
         _ => {}
@@ -551,6 +604,23 @@ fn collect_log_view_hwnds(nodes: &[BuiltNode]) -> Vec<HWND> {
             }
         }
         result.extend(collect_log_view_hwnds(&node.children));
+    }
+    result
+}
+
+/// Collect HWNDs of all RichEdit-based controls (CodeEditor + LogView)
+fn collect_rich_edit_hwnds(nodes: &[BuiltNode]) -> Vec<HWND> {
+    let mut result = Vec::new();
+    for node in nodes {
+        if let Some(ref ce) = node.code_editor {
+            result.push(ce.script_hwnd());
+        }
+        if node.log_view.is_some() {
+            if let Some(h) = node.hwnd {
+                result.push(h);
+            }
+        }
+        result.extend(collect_rich_edit_hwnds(&node.children));
     }
     result
 }

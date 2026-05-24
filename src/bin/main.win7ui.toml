@@ -2,8 +2,8 @@
 # 包含所有 DTT/BTT 支持的控件类型，用于验证完整性
 
 [fonts]
-ui = { face = "Microsoft YaHei", size = 16 }
-fixed = { face = "NSimSun", size = 16 }
+ui = { face = "Microsoft YaHei", size = 14 }
+fixed = { face = "NSimSun", size = 14 }
 
 [window]
 title = "PyAuto Rust - 全控件验证"

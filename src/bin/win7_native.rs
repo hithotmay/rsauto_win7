@@ -37,6 +37,15 @@ use windows_sys::Win32::{
 // WM_NOTIFY / NMHDR / TCN_SELCHANGE 所需的常量
 const WM_NOTIFY: u32 = 0x004E;
 const TCN_SELCHANGE: u32 = 0xFFFFFDD9;
+const EN_CHANGE: u32 = 0x0300;
+const BN_CLICKED: u32 = 0;
+const BST_CHECKED: isize = 1;
+
+// RichEdit 样式位
+const ES_AUTOHSCROLL: u32 = 0x0080;
+
+// 默认 gutter 宽度
+const DEFAULT_GUTTER_WIDTH: i32 = 48;
 
 // ─── 控件 ID（与 TOML 定义一一对应）──────────────────────────
 const IDC_SCRIPT: i32 = 101;
@@ -75,6 +84,8 @@ const IDC_CONFIRM_CANCEL: i32 = 307;
 
 const HOTKEY_RUN: i32 = 201;
 const HOTKEY_STOP: i32 = 202;
+const HOTKEY_SEARCH_NEXT: i32 = 203;
+const VK_F3: u32 = 0x72;
 const VK_F5: u32 = 0x74;
 const VK_F11: u32 = 0x7A;
 const MAX_LOG_CHARS: i32 = 80_000;
@@ -82,6 +93,7 @@ const MAX_RUN_LOG_LINES: usize = 1000;
 const LOG_SNAPSHOT_INTERVAL_MS: u64 = 160;
 const RUN_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_RUN, VK_F5);
 const STOP_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_STOP, VK_F11);
+const SEARCH_NEXT_HOTKEY: win7ui::HotKey = win7ui::HotKey::new(HOTKEY_SEARCH_NEXT, VK_F3);
 
 // ─── 扁平配色方案 ───────────────────────────────────────────
 const CLR_BG: COLORREF = 0x00F0F0F0; // 窗口背景：浅灰
@@ -136,6 +148,8 @@ struct AppState {
     current_file: Option<PathBuf>,
     capture: Option<CaptureState>,
     confirm: Option<ConfirmState>,
+    /// 搜索状态：当前搜索词
+    search_query: String,
 }
 
 impl Default for AppState {
@@ -149,6 +163,7 @@ impl Default for AppState {
             current_file: None,
             capture: None,
             confirm: None,
+            search_query: String::new(),
         }
     }
 }
@@ -233,6 +248,9 @@ enum AppEvent {
         mode: CaptureMode,
         result: Result<CapturedScreen, String>,
     },
+    VarsUpdate {
+        vars: Vec<(String, String)>,
+    },
 }
 
 // Safety: AppState is only accessed from the UI thread (via Mutex inside AppStore).
@@ -260,6 +278,7 @@ fn main() {
             .main_window("PyAutoRsWin7Native", "PyAuto Rust Win7 Native", 1120, 780)
             .hotkey(RUN_HOTKEY)
             .hotkey(STOP_HOTKEY)
+            .hotkey(SEARCH_NEXT_HOTKEY)
             .start_with_store(&APP)
         else {
             return;
@@ -279,6 +298,17 @@ fn main() {
 
 // ─── 主窗口过程 ─────────────────────────────────────────────
 
+/// 检测控件 HWND 是否为 RichEdit 类（RichEdit50W / RichEdit20W 等）
+fn is_richedit(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if len <= 0 {
+        return false;
+    }
+    let name = String::from_utf16_lossy(&buf[..len as usize]);
+    name.starts_with("RichEdit")
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -292,7 +322,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_COMMAND => {
-            match (wparam & 0xffff) as i32 {
+            let notify_code = (wparam >> 16) as u32;
+            let ctrl_id = (wparam & 0xffff) as i32;
+            // 搜索框 EN_CHANGE：实时搜索
+            if ctrl_id == IDC_EDIT_SEARCH && notify_code == EN_CHANGE {
+                do_search(false);
+            }
+            // Checkbox BN_CLICKED 处理
+            if notify_code == BN_CLICKED {
+                match ctrl_id {
+                    IDC_CHECK_WRAP => handle_check_wrap(),
+                    IDC_CHECK_LINENO => handle_check_lineno(),
+                    _ => {}
+                }
+            }
+            match ctrl_id {
                 IDC_RUN => start_script(),
                 IDC_STOP => stop_script(),
                 IDC_OPEN => open_script(),
@@ -334,6 +378,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             match wparam as i32 {
                 HOTKEY_RUN => start_script(),
                 HOTKEY_STOP => stop_script(),
+                HOTKEY_SEARCH_NEXT => do_search(true), // F3 = find next
                 _ => {}
             }
             0
@@ -362,7 +407,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             FLAT_BG_BRUSH as _
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-            // 编辑框和列表：白底
+            // RichEdit 控件自行管理文字/背景色，通过 WM_CTLCOLOREDIT 干预会导致
+            // 文字不可见（需框选才能看到），所以对 RichEdit 直接走 DefWindowProcW。
+            if is_richedit(lparam as _) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            // 普通编辑框和列表：白底
             SetTextColor(wparam as _, CLR_TEXT);
             SetBkColor(wparam as _, CLR_EDIT_BG);
             FLAT_EDIT_BRUSH as _
@@ -486,6 +536,8 @@ unsafe fn start_script() {
         let mut total_lines = 0usize;
         let result = Runner::new(stop_requested).and_then(|mut runner| {
             let mut last_flush = Instant::now();
+            let mut last_vars_flush = Instant::now();
+            let vars_tx = tx.clone();
 
             runner.run_script(&script, |msg| {
                 if log_stop.load(Ordering::Relaxed) {
@@ -496,6 +548,12 @@ unsafe fn start_script() {
                 if last_flush.elapsed() >= Duration::from_millis(LOG_SNAPSHOT_INTERVAL_MS) {
                     send_log_snapshot(&tx, &tail_logs, total_lines);
                     last_flush = Instant::now();
+                }
+            }, |vars| {
+                if last_vars_flush.elapsed() >= Duration::from_millis(500) {
+                    let _ = vars_tx.send(AppEvent::VarsUpdate { vars });
+                    unsafe { vars_tx.wake(); }
+                    last_vars_flush = Instant::now();
                 }
             })?;
             Ok(())
@@ -1177,6 +1235,88 @@ unsafe fn handle_insert_button() {
     }
 }
 
+/// 切换自动换行：修改编辑器 RichEdit 的 WS_HSCROLL / ES_AUTOHSCROLL 样式
+unsafe fn handle_check_wrap() {
+    let Some(app_lock) = APP.get() else { return; };
+
+    // 读取 checkbox 状态
+    let wrap = {
+        let app = app_lock.lock().unwrap();
+        let Some(ref built) = app.built else { return };
+        let Some(check_hwnd) = built.hwnd_by_id(IDC_CHECK_WRAP) else { return };
+        SendMessageW(check_hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED
+    };
+
+    // 获取编辑器脚本区域的 HWND
+    let script_hwnd = {
+        let app = app_lock.lock().unwrap();
+        app.built.as_ref().and_then(|b| b.node_by_id(IDC_SCRIPT))
+            .and_then(|nref| nref.code_editor.map(|ce| ce.script_hwnd()))
+    };
+    let Some(script_hwnd) = script_hwnd else { return };
+
+    // 修改样式
+    let style = GetWindowLongW(script_hwnd, GWL_STYLE) as u32;
+    let new_style = if wrap {
+        // 自动换行：移除水平滚动条和自动水平滚动
+        style & !(WS_HSCROLL as u32) & !(ES_AUTOHSCROLL)
+    } else {
+        // 不换行：添加水平滚动条和自动水平滚动
+        style | WS_HSCROLL as u32 | ES_AUTOHSCROLL
+    };
+    SetWindowLongW(script_hwnd, GWL_STYLE, new_style as i32);
+
+    // 重新应用窗口样式，需要 SetWindowPos 刷新框架
+    SetWindowPos(
+        script_hwnd,
+        null_mut(),
+        0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+    );
+
+    // 触发重新布局
+    let main_hwnd = {
+        let app = app_lock.lock().unwrap();
+        app.hwnd as HWND
+    };
+    let mut rect = RECT::default();
+    GetClientRect(main_hwnd, &mut rect);
+    let mut app = app_lock.lock().unwrap();
+    if let Some(ref mut built) = app.built {
+        built.on_resize(rect.right - rect.left, rect.bottom - rect.top);
+    }
+}
+
+/// 切换行号显示：修改 gutter 宽度并重新布局
+unsafe fn handle_check_lineno() {
+    let Some(app_lock) = APP.get() else { return; };
+
+    // 读取 checkbox 状态
+    let show_lineno = {
+        let app = app_lock.lock().unwrap();
+        let Some(ref built) = app.built else { return };
+        let Some(check_hwnd) = built.hwnd_by_id(IDC_CHECK_LINENO) else { return };
+        SendMessageW(check_hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED
+    };
+
+    let gutter_width = if show_lineno { DEFAULT_GUTTER_WIDTH } else { 0 };
+
+    // 获取窗口客户区大小
+    let main_hwnd = {
+        let app = app_lock.lock().unwrap();
+        app.hwnd as HWND
+    };
+    let mut rect = RECT::default();
+    GetClientRect(main_hwnd, &mut rect);
+
+    // 更新 gutter 宽度并重新布局
+    let mut app = app_lock.lock().unwrap();
+    if let Some(ref mut built) = app.built {
+        built.set_editor_gutter_width(IDC_SCRIPT, gutter_width);
+        built.on_resize(rect.right - rect.left, rect.bottom - rect.top);
+    }
+}
+
 unsafe fn refresh_editor_view() {
     let Some(app) = APP.get() else { return; };
     let editor = app.lock().unwrap().editor().unwrap();
@@ -1193,6 +1333,73 @@ unsafe fn refresh_editor_marks() {
     let Some(app) = APP.get() else { return; };
     let editor = app.lock().unwrap().editor().unwrap();
     editor.refresh_marks();
+}
+
+// ─── 搜索功能 ─────────────────────────────────────────────────
+
+/// 执行搜索。如果 `find_next` 为 true（F3 热键），从当前选中位置之后搜索下一个匹配；
+/// 如果为 false（搜索框输入），从头开始搜索。
+unsafe fn do_search(find_next: bool) {
+    let Some(app_lock) = APP.get() else { return; };
+
+    // 1. 读取搜索框文本
+    let query = {
+        let app = app_lock.lock().unwrap();
+        let Some(ref built) = app.built else { return; };
+        let Some(search_hwnd) = built.hwnd_by_id(IDC_EDIT_SEARCH) else { return; };
+        win7ui::get_window_text(search_hwnd)
+    };
+
+    if query.is_empty() {
+        return;
+    }
+
+    // 2. 获取当前选中位置（用于 find_next）
+    let start_pos = if find_next {
+        let app = app_lock.lock().unwrap();
+        let Some(editor) = app.editor() else { return; };
+        let (_sel_start, sel_end) = editor.get_selection();
+        // 从当前选中结尾开始搜索
+        if sel_end > 0 { sel_end } else { 0 }
+    } else {
+        0
+    };
+
+    // 3. 执行搜索
+    let result = {
+        let app = app_lock.lock().unwrap();
+        let Some(editor) = app.editor() else { return; };
+        editor.find_text(&query, start_pos)
+    };
+
+    // 4. 如果没找到且 find_next，从头搜索（wrap）
+    let result = match result {
+        Some(r) => Some(r),
+        None if find_next && start_pos > 0 => {
+            // wrap: 从头开始搜索
+            let app = app_lock.lock().unwrap();
+            let Some(editor) = app.editor() else { return; };
+            editor.find_text(&query, 0)
+        }
+        other => other,
+    };
+
+    // 5. 选中并滚动到匹配位置
+    if let Some((start, end)) = result {
+        let app = app_lock.lock().unwrap();
+        let Some(editor) = app.editor() else { return; };
+        editor.select_and_scroll(start, end);
+        drop(app);
+        let mut app = app_lock.lock().unwrap();
+        app.search_query = query;
+    } else if !find_next {
+        // 搜索框实时搜索未找到：取消选择
+        let app = app_lock.lock().unwrap();
+        if let Some(editor) = app.editor() {
+            let (sel_start, _) = editor.get_selection();
+            editor.select_and_scroll(sel_start, sel_start);
+        }
+    }
 }
 
 unsafe fn handle_editor_timer(timer_id: WPARAM) -> bool {
@@ -1246,6 +1453,21 @@ unsafe fn drain_events() {
                         ShowWindow(main_hwnd(), SW_SHOW);
                         append_log(&format!("截图失败：{err}"));
                         set_status("截图失败。");
+                    }
+                }
+            }
+            AppEvent::VarsUpdate { vars } => {
+                let text: String = vars
+                    .iter()
+                    .map(|(name, value)| format!("{name} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\r\n");
+                if let Some(app) = APP.get() {
+                    let app = app.lock().unwrap();
+                    if let Some(built) = app.built.as_ref() {
+                        if let Some(h) = built.hwnd_by_id(IDC_VAR_VIEW) {
+                            win7ui::set_window_text(h, &text);
+                        }
                     }
                 }
             }

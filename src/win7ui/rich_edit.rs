@@ -2,7 +2,7 @@ use std::ptr::null_mut;
 
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
-    Graphics::Gdi::InvalidateRect,
+    Graphics::Gdi::{InvalidateRect, RedrawWindow},
     System::LibraryLoader::LoadLibraryW,
     UI::{
         Controls::{
@@ -10,9 +10,10 @@ use windows_sys::Win32::{
             EM_REPLACESEL, EM_SCROLLCARET, EM_SETSEL,
         },
         WindowsAndMessaging::{
-            CreateWindowExW, SendMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-            ES_NOHIDESEL, ES_WANTRETURN, GWL_STYLE, SW_HIDE, SW_SHOW, WM_SETREDRAW, WS_BORDER,
-            WS_CHILD, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL, WM_GETTEXTLENGTH,
+            CreateWindowExW, GetClientRect, SendMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
+            ES_MULTILINE, ES_NOHIDESEL, ES_WANTRETURN, GWL_STYLE, SW_HIDE, SW_SHOW,
+            WM_GETTEXTLENGTH, WM_SETREDRAW, WM_SIZE, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE,
+            WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
         },
     },
 };
@@ -22,17 +23,36 @@ use super::{module_handle, replace_edit_text, set_window_text, wide};
 const EM_EXSETSEL: u32 = 0x0400 + 55;
 const EM_EXGETSEL: u32 = 0x0400 + 52;
 const EM_SETCHARFORMAT: u32 = 0x0400 + 68;
+const EM_GETCHARFORMAT: u32 = 0x0400 + 58;
 const EM_POSFROMCHAR_RICH: u32 = 0x0400 + 38;
 const EM_LINESCROLL: u32 = 0x00B6;
+const EM_FINDTEXTEXW: u32 = 0x0400 + 79;
+/// EM_GETSCROLLPOS / EM_SETSCROLLPOS: 像素级精确保存/恢复滚动位置
+const EM_GETSCROLLPOS: u32 = 0x0400 + 221;
+const EM_SETSCROLLPOS: u32 = 0x0400 + 222;
 const SCF_SELECTION: WPARAM = 0x0001;
+const SCF_ALL: WPARAM = 0x0004;
+const SCF_DEFAULT: WPARAM = 0x0000;
+const CFM_FACE: u32 = 0x20000000;
+const CFM_SIZE: u32 = 0x80000000;
 const CFM_COLOR: u32 = 0x40000000;
 const CFM_BACKCOLOR: u32 = 0x04000000;
 const CFE_AUTOBACKCOLOR: u32 = 0x04000000;
+
+/// FR_DOWN | FR_NOGROUPROUND for case-insensitive forward search
+const FR_DOWN: u32 = 0x00000001;
 
 #[repr(C)]
 struct CharRange {
     cp_min: i32,
     cp_max: i32,
+}
+
+#[repr(C)]
+struct FindTextExW {
+    chrg: CharRange,
+    lpstr_text: *const u16,
+    chrg_text: CharRange,
 }
 
 #[repr(C)]
@@ -93,6 +113,81 @@ pub struct HighlightSpan {
 impl RichEdit {
     pub fn new(hwnd: HWND) -> Self {
         Self { hwnd }
+    }
+
+    /// Apply the given HFONT to RichEdit via EM_SETCHARFORMAT.
+    /// WM_SETFONT alone is insufficient — SetWindowText/EM_REPLACESEL/paste may
+    /// use a different font. This reads LOGFONT from the HFONT handle and applies
+    /// it to ALL text (SCF_ALL) and sets it as the default (SCF_DEFAULT).
+    pub unsafe fn sync_font(self, hfont: isize) {
+        use windows_sys::Win32::Graphics::Gdi::GetObjectW;
+        #[repr(C)]
+        #[derive(Default)]
+        struct LogFontW {
+            lf_height: i32,
+            lf_width: i32,
+            lf_escapement: i32,
+            lf_orientation: i32,
+            lf_weight: i32,
+            lf_italic: u8,
+            lf_underline: u8,
+            lf_strike_out: u8,
+            lf_char_set: u8,
+            lf_out_precision: u8,
+            lf_clip_precision: u8,
+            lf_quality: u8,
+            lf_pitch_and_family: u8,
+            lf_face_name: [u16; 32],
+        }
+        let mut lf: LogFontW = std::mem::zeroed();
+        let ok = GetObjectW(
+            hfont as *mut std::ffi::c_void,
+            std::mem::size_of::<LogFontW>() as i32,
+            &mut lf as *mut LogFontW as *mut std::ffi::c_void,
+        );
+        if ok == 0 {
+            return;
+        }
+        let y_height = (-lf.lf_height * 15).max(0) as i32; // pixels → twips: ×1440/96 = ×15
+        let mut cf = CharFormatW {
+            cb_size: std::mem::size_of::<CharFormatW>() as u32,
+            dw_mask: CFM_FACE | CFM_SIZE,
+            dw_effects: 0,
+            y_height,
+            y_offset: 0,
+            cr_text_color: 0,
+            b_char_set: lf.lf_char_set,
+            b_pitch_and_family: lf.lf_pitch_and_family,
+            sz_face_name: [0; 32],
+        };
+        let len = lf
+            .lf_face_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(31)
+            .min(31);
+        cf.sz_face_name[..len].copy_from_slice(&lf.lf_face_name[..len]);
+        // Apply to ALL existing text
+        SendMessageW(
+            self.hwnd,
+            EM_SETCHARFORMAT,
+            SCF_ALL,
+            &mut cf as *mut CharFormatW as LPARAM,
+        );
+        // Set as default for future input/paste
+        SendMessageW(
+            self.hwnd,
+            EM_SETCHARFORMAT,
+            SCF_DEFAULT,
+            &mut cf as *mut CharFormatW as LPARAM,
+        );
+        // 禁用 RichEdit 自动字体切换 (IMF_AUTOFONT)
+        // 默认开启时，输入英文/数字会自动切到西文字体，导致不一致
+        const EM_GETLANGOPTIONS: u32 = 0x0400 + 121;
+        const EM_SETLANGOPTIONS: u32 = 0x0400 + 120;
+        const IMF_AUTOFONT: isize = 0x00000002;
+        let opts = SendMessageW(self.hwnd, EM_GETLANGOPTIONS, 0, 0);
+        SendMessageW(self.hwnd, EM_SETLANGOPTIONS, 0, (opts & !IMF_AUTOFONT) as LPARAM);
     }
 
     pub unsafe fn create(
@@ -163,7 +258,14 @@ impl RichEdit {
     }
 
     pub unsafe fn set_text(self, text: &str) {
-        set_window_text(self.hwnd, text);
+        // 用 EM_SETSEL + EM_REPLACESEL 代替 SetWindowTextW
+        // SetWindowTextW 会重置所有字符格式，导致字体不一致
+        SendMessageW(self.hwnd, WM_SETREDRAW, 0, 0);
+        SendMessageW(self.hwnd, EM_SETSEL, 0, -1 as LPARAM);
+        SendMessageW(self.hwnd, EM_REPLACESEL, 0, wide(text).as_ptr() as LPARAM);
+        SendMessageW(self.hwnd, EM_SETSEL, 0, 0); // 光标移到开头
+        SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
+        RedrawWindow(self.hwnd, std::ptr::null(), std::ptr::null_mut(), 0x0485);
     }
 
     pub unsafe fn replace_text(self, text: &str) {
@@ -171,7 +273,8 @@ impl RichEdit {
     }
 
     pub unsafe fn insert_at_end(self, text: &str) {
-        SendMessageW(self.hwnd, EM_SETSEL, usize::MAX, isize::MAX);
+        let text_len = SendMessageW(self.hwnd, WM_GETTEXTLENGTH, 0, 0).max(0) as usize;
+        SendMessageW(self.hwnd, EM_SETSEL, text_len as WPARAM, text_len as LPARAM);
         SendMessageW(
             self.hwnd,
             EM_REPLACESEL,
@@ -180,7 +283,6 @@ impl RichEdit {
         );
     }
 
-    /// 在当前光标行之后插入一行文本
     pub unsafe fn insert_after_current_line(self, line: &str) {
         let mut range = CharRange { cp_min: 0, cp_max: 0 };
         SendMessageW(self.hwnd, EM_EXGETSEL, 0, &mut range as *mut CharRange as LPARAM);
@@ -272,11 +374,32 @@ impl RichEdit {
         }
     }
 
-    pub unsafe fn apply_highlights(self, text_len: usize, spans: &[HighlightSpan], default_color: u32) {
+    /// 用像素级精度保存并恢复滚动位置
+    unsafe fn save_scroll_pos(self) -> PointL {
+        let mut pt = PointL { x: 0, y: 0 };
+        SendMessageW(self.hwnd, EM_GETSCROLLPOS, 0, &mut pt as *mut PointL as LPARAM);
+        pt
+    }
+
+    unsafe fn restore_scroll_pos(self, pt: PointL) {
+        SendMessageW(self.hwnd, EM_SETSCROLLPOS, 0, &pt as *const PointL as LPARAM);
+    }
+
+    /// WM_SETREDRAW(1) 后刷新显示（不发 WM_SIZE 避免滚动位置被重置）
+    unsafe fn finish_redraw(self) {
+        InvalidateRect(self.hwnd, null_mut(), 1);
+    }
+
+    pub unsafe fn apply_highlights(
+        self,
+        text_len: usize,
+        spans: &[HighlightSpan],
+        default_color: u32,
+    ) {
         if self.hwnd.is_null() {
             return;
         }
-        let first_visible = self.first_visible_line();
+        let scroll_pos = self.save_scroll_pos();
         let mut original = CharRange {
             cp_min: 0,
             cp_max: 0,
@@ -292,15 +415,16 @@ impl RichEdit {
         for span in spans {
             self.apply_color(span.start, span.end, span.color);
         }
+        // 恢复选区 + 滚动位置（在 WM_SETREDRAW(1) 之前，避免触发可见的自动滚动）
         SendMessageW(
             self.hwnd,
             EM_EXSETSEL,
             0,
             &mut original as *mut CharRange as LPARAM,
         );
-        self.scroll_to_first_visible_line(first_visible);
+        self.restore_scroll_pos(scroll_pos);
         SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
-        InvalidateRect(self.hwnd, null_mut(), 1);
+        self.finish_redraw();
     }
 
     pub unsafe fn apply_line_markers(
@@ -314,7 +438,7 @@ impl RichEdit {
         if self.hwnd.is_null() {
             return;
         }
-        let first_visible = self.first_visible_line();
+        let scroll_pos = self.save_scroll_pos();
         let mut original = CharRange {
             cp_min: 0,
             cp_max: 0,
@@ -339,15 +463,78 @@ impl RichEdit {
                 self.apply_back_color(start, end, error_color);
             }
         }
+        // 恢复选区 + 滚动位置（在 WM_SETREDRAW(1) 之前，避免触发可见的自动滚动）
         SendMessageW(
             self.hwnd,
             EM_EXSETSEL,
             0,
             &mut original as *mut CharRange as LPARAM,
         );
-        self.scroll_to_first_visible_line(first_visible);
+        self.restore_scroll_pos(scroll_pos);
         SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
-        InvalidateRect(self.hwnd, null_mut(), 1);
+        self.finish_redraw();
+    }
+
+    /// Search for text starting from `start_pos` (UTF-16 char index), case-insensitive.
+    /// Returns (start, end) UTF-16 char indices if found.
+    pub unsafe fn find_text(self, query: &str, start_pos: usize) -> Option<(usize, usize)> {
+        if self.hwnd.is_null() || query.is_empty() {
+            return None;
+        }
+        let text_len = SendMessageW(self.hwnd, WM_GETTEXTLENGTH, 0, 0).max(0) as i32;
+        if start_pos as i32 > text_len {
+            return None;
+        }
+        let query_wide = wide(query);
+        let mut find = FindTextExW {
+            chrg: CharRange {
+                cp_min: start_pos as i32,
+                cp_max: text_len,
+            },
+            lpstr_text: query_wide.as_ptr(),
+            chrg_text: CharRange {
+                cp_min: 0,
+                cp_max: 0,
+            },
+        };
+        let result = SendMessageW(
+            self.hwnd,
+            EM_FINDTEXTEXW,
+            FR_DOWN as WPARAM,
+            &mut find as *mut FindTextExW as LPARAM,
+        );
+        if result >= 0 {
+            Some((
+                find.chrg_text.cp_min as usize,
+                find.chrg_text.cp_max as usize,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Select the given range and scroll it into view.
+    pub unsafe fn select_and_scroll(self, start: usize, end: usize) {
+        if self.hwnd.is_null() {
+            return;
+        }
+        SendMessageW(self.hwnd, EM_SETSEL, start, end as isize);
+        SendMessageW(self.hwnd, EM_SCROLLCARET, 0, 0);
+    }
+
+    /// Get current selection range (cp_min, cp_max) in UTF-16 char indices.
+    pub unsafe fn get_selection(self) -> (usize, usize) {
+        let mut range = CharRange {
+            cp_min: 0,
+            cp_max: 0,
+        };
+        SendMessageW(self.hwnd, EM_EXGETSEL, 0, &mut range as *mut CharRange as LPARAM);
+        (range.cp_min.max(0) as usize, range.cp_max.max(0) as usize)
+    }
+
+    /// Get text length in UTF-16 char units.
+    pub unsafe fn text_length(self) -> usize {
+        SendMessageW(self.hwnd, WM_GETTEXTLENGTH, 0, 0).max(0) as usize
     }
 
     unsafe fn apply_color(self, start: usize, end: usize, color: u32) {

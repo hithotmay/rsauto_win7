@@ -36,12 +36,13 @@ impl Runner {
     }
 
     #[allow(unreachable_code)]
-    pub fn run_script<F>(&mut self, script: &str, mut log: F) -> Result<(), RunError>
+    pub fn run_script<F, V>(&mut self, script: &str, mut log: F, mut vars_cb: V) -> Result<(), RunError>
     where
         F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
     {
         let mut interpreter = ScriptInterpreter::new(script)?;
-        return interpreter.run(self, &mut log);
+        return interpreter.run(self, &mut log, &mut vars_cb);
 
         for (idx, raw_line) in script.lines().enumerate() {
             let line_no = idx + 1;
@@ -210,12 +211,20 @@ impl Iterator for ForRange {
     }
 }
 
+enum ForIter {
+    Range(ForRange),
+    Values(Vec<Value>),
+}
+
 #[derive(Clone, Debug)]
 enum Value {
     Number(f64),
     Text(String),
     Bool(bool),
     List(Vec<Value>),
+    Dict(HashMap<String, Value>),
+    Tuple(Vec<Value>),
+    None,
 }
 
 impl Value {
@@ -225,6 +234,9 @@ impl Value {
             Value::Text(value) => !value.is_empty(),
             Value::Bool(value) => *value,
             Value::List(items) => !items.is_empty(),
+            Value::Dict(map) => !map.is_empty(),
+            Value::Tuple(items) => !items.is_empty(),
+            Value::None => false,
         }
     }
 
@@ -241,6 +253,28 @@ impl Value {
                 }).collect();
                 format!("[{}]", inner.join(", "))
             }
+            Value::Dict(map) => {
+                let inner: Vec<String> = map.iter().map(|(k, v)| {
+                    let val = match v {
+                        Value::Text(s) => format!("'{s}'"),
+                        other => other.to_script_string(),
+                    };
+                    format!("'{k}': {val}")
+                }).collect();
+                format!("{{{}}}", inner.join(", "))
+            }
+            Value::Tuple(items) => {
+                let inner: Vec<String> = items.iter().map(|v| match v {
+                    Value::Text(s) => format!("'{s}'"),
+                    other => other.to_script_string(),
+                }).collect();
+                if items.len() == 1 {
+                    format!("({},)", inner.join(", "))
+                } else {
+                    format!("({})", inner.join(", "))
+                }
+            }
+            Value::None => "None".to_string(),
         }
     }
 
@@ -251,6 +285,9 @@ impl Value {
             Value::Text(_) => "str",
             Value::Bool(_) => "bool",
             Value::List(_) => "list",
+            Value::Dict(_) => "dict",
+            Value::Tuple(_) => "tuple",
+            Value::None => "NoneType",
         }
     }
 
@@ -262,7 +299,8 @@ impl Value {
                 .trim()
                 .parse::<i64>()
                 .map_err(|_| line_error(line_no, &format!("cannot convert to int: {value}"))),
-            Value::List(_) => Err(line_error(line_no, "cannot convert list to int")),
+            Value::None => Err(line_error(line_no, "cannot convert NoneType to int")),
+            _ => Err(line_error(line_no, &format!("cannot convert {} to int", self.type_name()))),
         }
     }
 
@@ -274,7 +312,8 @@ impl Value {
                 .trim()
                 .parse::<f64>()
                 .map_err(|_| line_error(line_no, &format!("cannot convert to float: {value}"))),
-            Value::List(_) => Err(line_error(line_no, "cannot convert list to float")),
+            Value::None => Err(line_error(line_no, "cannot convert NoneType to float")),
+            _ => Err(line_error(line_no, &format!("cannot convert {} to float", self.type_name()))),
         }
     }
 }
@@ -323,14 +362,28 @@ impl ScriptInterpreter {
         Ok(interpreter)
     }
 
-    fn run<F>(&mut self, runner: &mut Runner, log: &mut F) -> Result<(), RunError>
+    pub fn snapshot_vars(&self) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for scope in self.scopes.iter().rev() {
+            for (name, value) in scope {
+                if seen.insert(name.clone()) {
+                    vars.push((name.clone(), value.to_script_string()));
+                }
+            }
+        }
+        vars
+    }
+
+    fn run<F, V>(&mut self, runner: &mut Runner, log: &mut F, vars_cb: &mut V) -> Result<(), RunError>
     where
         F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
     {
         let mut pc = 0;
         while pc < self.lines.len() {
             runner.check_stop()?;
-            match self.execute_at(pc, runner, log)? {
+            match self.execute_at(pc, runner, log, vars_cb)? {
                 (Flow::Continue, next) => pc = next,
                 (Flow::Goto(label), _) => pc = self.goto_target(&label, self.lines[pc].line_no)?,
                 (Flow::Break, _) => {
@@ -340,8 +393,14 @@ impl ScriptInterpreter {
                     return Err(line_error(self.lines[pc].line_no, "continue outside loop"));
                 }
                 (Flow::Return(_), _) => {
-                    return Err(line_error(self.lines[pc].line_no, "return outside function"));
+                    return Err(line_error(
+                        self.lines[pc].line_no,
+                        "return outside function",
+                    ));
                 }
+            }
+            if self.steps % 100 == 0 {
+                vars_cb(self.snapshot_vars());
             }
         }
         Ok(())
@@ -384,20 +443,22 @@ impl ScriptInterpreter {
         Ok((body_start, body_end))
     }
 
-    fn execute_block<F>(
+    fn execute_block<F, V>(
         &mut self,
         start: usize,
         end: usize,
         runner: &mut Runner,
         log: &mut F,
+        vars_cb: &mut V,
     ) -> Result<Flow, RunError>
     where
         F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
     {
         let mut pc = start;
         while pc < end {
             runner.check_stop()?;
-            match self.execute_at(pc, runner, log)? {
+            match self.execute_at(pc, runner, log, vars_cb)? {
                 (Flow::Continue, next) => pc = next,
                 (flow @ (Flow::Break | Flow::ContinueLoop | Flow::Goto(_) | Flow::Return(_)), _) => return Ok(flow),
             }
@@ -405,14 +466,16 @@ impl ScriptInterpreter {
         Ok(Flow::Continue)
     }
 
-    fn execute_at<F>(
+    fn execute_at<F, V>(
         &mut self,
         pc: usize,
         runner: &mut Runner,
         log: &mut F,
+        vars_cb: &mut V,
     ) -> Result<(Flow, usize), RunError>
     where
         F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
     {
         runner.check_stop()?;
         self.steps += 1;
@@ -433,7 +496,7 @@ impl ScriptInterpreter {
             return Ok((Flow::Continue, end));
         }
         if text.starts_with("if ") {
-            return self.execute_if_chain(pc, runner, log);
+            return self.execute_if_chain(pc, runner, log, vars_cb);
         }
         if text.starts_with("elif ") || text == "else:" {
             return Err(line_error(
@@ -460,17 +523,34 @@ impl ScriptInterpreter {
             return Ok((Flow::Return(value), pc + 1));
         }
         if text.starts_with("for ") {
-            let (var, values) = self.parse_for(text, line.line_no)?;
+            let (var, iter) = self.parse_for(text, line.line_no)?;
             let (body_start, body_end) = self.block_bounds(pc)?;
-            for value in values {
-                runner.check_stop()?;
-                self.set_var(&var, Value::Number(value as f64));
-                match self.execute_block(body_start, body_end, runner, log)? {
-                    Flow::Continue => {}
-                    Flow::ContinueLoop => continue,
-                    Flow::Break => break,
-                    flow @ Flow::Goto(_) => return Ok((flow, pc + 1)),
-                    flow @ Flow::Return(_) => return Ok((flow, pc + 1)),
+            match iter {
+                ForIter::Range(values) => {
+                    for value in values {
+                        runner.check_stop()?;
+                        self.set_var(&var, Value::Number(value as f64));
+                        match self.execute_block(body_start, body_end, runner, log, vars_cb)? {
+                            Flow::Continue => {}
+                            Flow::ContinueLoop => continue,
+                            Flow::Break => break,
+                            flow @ Flow::Goto(_) => return Ok((flow, pc + 1)),
+                            flow @ Flow::Return(_) => return Ok((flow, pc + 1)),
+                        }
+                    }
+                }
+                ForIter::Values(vals) => {
+                    for value in vals {
+                        runner.check_stop()?;
+                        self.set_var(&var, value);
+                        match self.execute_block(body_start, body_end, runner, log, vars_cb)? {
+                            Flow::Continue => {}
+                            Flow::ContinueLoop => continue,
+                            Flow::Break => break,
+                            flow @ Flow::Goto(_) => return Ok((flow, pc + 1)),
+                            flow @ Flow::Return(_) => return Ok((flow, pc + 1)),
+                        }
+                    }
                 }
             }
             return Ok((Flow::Continue, body_end));
@@ -488,7 +568,7 @@ impl ScriptInterpreter {
                 if loop_count > 100_000 {
                     return Err(line_error(line.line_no, "while loop ran too many times"));
                 }
-                match self.execute_block(body_start, body_end, runner, log)? {
+                match self.execute_block(body_start, body_end, runner, log, vars_cb)? {
                     Flow::Continue => {}
                     Flow::ContinueLoop => continue,
                     Flow::Break => break,
@@ -499,18 +579,25 @@ impl ScriptInterpreter {
             return Ok((Flow::Continue, body_end));
         }
 
-        self.execute_statement(text, line.line_no, runner, log)?;
+        // try / except / else / finally
+        if text.starts_with("try:") || text == "try:" {
+            return self.execute_try_block(pc, runner, log, vars_cb);
+        }
+
+        self.execute_statement(text, line.line_no, runner, log, vars_cb)?;
         Ok((Flow::Continue, pc + 1))
     }
 
-    fn execute_if_chain<F>(
+    fn execute_if_chain<F, V>(
         &mut self,
         start: usize,
         runner: &mut Runner,
         log: &mut F,
+        vars_cb: &mut V,
     ) -> Result<(Flow, usize), RunError>
     where
         F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
     {
         let base_indent = self.lines[start].indent;
         let mut branch = start;
@@ -537,7 +624,7 @@ impl ScriptInterpreter {
                 None => true,
             };
             if should_run {
-                let flow = self.execute_block(body_start, body_end, runner, log)?;
+                let flow = self.execute_block(body_start, body_end, runner, log, vars_cb)?;
                 return Ok((flow, chain_end));
             }
 
@@ -565,16 +652,371 @@ impl ScriptInterpreter {
         Ok(end)
     }
 
-    fn execute_statement<F>(
+    /// Execute a try/except/else/finally block with runner.
+    fn execute_try_block<F, V>(
+        &mut self,
+        start_pc: usize,
+        runner: &mut Runner,
+        log: &mut F,
+        vars_cb: &mut V,
+    ) -> Result<(Flow, usize), RunError>
+    where
+        F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
+    {
+        let base_indent = self.lines[start_pc].indent;
+        let (try_body_start, try_body_end) = self.block_bounds(start_pc)?;
+        let total_lines = self.lines.len();
+
+        // Scan for except/else/finally clauses
+        let mut except_clauses: Vec<(usize, usize, Option<String>, Option<String>)> = Vec::new();
+        let mut else_clause: Option<(usize, usize)> = None;
+        let mut finally_clause: Option<(usize, usize)> = None;
+
+        let mut scan = try_body_end;
+        while scan < total_lines {
+            let sl = &self.lines[scan];
+            if sl.indent != base_indent { break; }
+            if let Some(rest) = sl.text.strip_prefix("except ") {
+                let rest = rest.strip_suffix(':').unwrap_or(rest);
+                let (exc_type, alias) = parse_except_header(rest.trim());
+                let (bs, be) = self.block_bounds(scan)?;
+                except_clauses.push((bs, be, exc_type, alias));
+                scan = be;
+            } else if sl.text == "except:" {
+                let (bs, be) = self.block_bounds(scan)?;
+                except_clauses.push((bs, be, None, None));
+                scan = be;
+            } else if sl.text == "else:" {
+                let (bs, be) = self.block_bounds(scan)?;
+                else_clause = Some((bs, be));
+                scan = be;
+            } else if sl.text == "finally:" {
+                let (bs, be) = self.block_bounds(scan)?;
+                finally_clause = Some((bs, be));
+                scan = be;
+            } else {
+                break;
+            }
+        }
+        let chain_end = scan;
+
+        // Execute try body
+        let try_result = self.execute_block(try_body_start, try_body_end, runner, log, vars_cb);
+
+        match try_result {
+            Ok(flow) => {
+                let mut final_flow = flow;
+                if let Some((bs, be)) = else_clause {
+                    match final_flow {
+                        Flow::Continue => {
+                            final_flow = self.execute_block(bs, be, runner, log, vars_cb)?;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some((bs, be)) = finally_clause {
+                    let fflow = self.execute_block(bs, be, runner, log, vars_cb)?;
+                    match fflow {
+                        Flow::Return(v) => final_flow = Flow::Return(v),
+                        Flow::Break => final_flow = Flow::Break,
+                        Flow::ContinueLoop => final_flow = Flow::ContinueLoop,
+                        _ => {}
+                    }
+                }
+                Ok((final_flow, chain_end))
+            }
+            Err(err) => {
+                let err_msg = format!("{err}");
+                let mut matched = false;
+                let mut final_flow = Flow::Continue;
+                for (bs, be, exc_type, alias) in &except_clauses {
+                    let catches = match exc_type {
+                        None => true,
+                        Some(t) => err_msg.starts_with(&format!("{}:", t)) || t == "Exception",
+                    };
+                    if catches {
+                        matched = true;
+                        if let Some(alias_name) = alias {
+                            let msg_part = if let Some(colon_pos) = err_msg.find(": ") {
+                                err_msg[colon_pos + 2..].to_string()
+                            } else {
+                                err_msg.clone()
+                            };
+                            self.set_var(alias_name, Value::Text(msg_part));
+                        }
+                        let flow = self.execute_block(*bs, *be, runner, log, vars_cb)?;
+                        final_flow = flow;
+                        break;
+                    }
+                }
+                if !matched {
+                    if let Some((bs, be)) = finally_clause {
+                        let _ = self.execute_block(bs, be, runner, log, vars_cb);
+                    }
+                    return Err(err);
+                }
+                if let Some((bs, be)) = finally_clause {
+                    let fflow = self.execute_block(bs, be, runner, log, vars_cb)?;
+                    match fflow {
+                        Flow::Return(v) => final_flow = Flow::Return(v),
+                        Flow::Break => final_flow = Flow::Break,
+                        Flow::ContinueLoop => final_flow = Flow::ContinueLoop,
+                        _ => {}
+                    }
+                }
+                Ok((final_flow, chain_end))
+            }
+        }
+    }
+
+    fn try_augmented_assignment(
+        &mut self,
+        text: &str,
+        line_no: usize,
+    ) -> Result<Option<()>, RunError> {
+        // Check for augmented assignment operators: +=, -=, *=, /=, //=, **=, %=
+        let augmented_ops: &[(&str, &str)] = &[
+            ("+=", "+"),
+            ("-=", "-"),
+            ("*=", "*"),
+            ("/=", "/"),
+            ("//=", "//"),
+            ("**=", "**"),
+            ("%=", "%"),
+        ];
+
+        // Find the augmented operator outside brackets/quotes
+        let mut quote: Option<char> = None;
+        let mut depth = 0i32;
+        for (idx, ch) in text.char_indices() {
+            if ch == '"' || ch == '\'' {
+                quote = if quote == Some(ch) {
+                    None
+                } else if quote.is_none() {
+                    Some(ch)
+                } else {
+                    quote
+                };
+            }
+            if quote.is_some() {
+                continue;
+            }
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                continue;
+            }
+            for &(op_str, _op_base) in augmented_ops {
+                if text[idx..].starts_with(op_str) {
+                    let name_part = text[..idx].trim();
+                    let expr_part = text[idx + op_str.len()..].trim();
+                    // Verify name_part is a valid identifier (or name[subscript])
+                    if name_part.is_empty() || expr_part.is_empty() {
+                        continue;
+                    }
+                    // Check if name_part has a subscript (e.g., x[0])
+                    if let Some(bracket_pos) = name_part.find('[') {
+                        let var_name = &name_part[..bracket_pos];
+                        if !var_name
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            continue;
+                        }
+                        // Evaluate the subscript expression
+                        let subscript_expr =
+                            name_part[bracket_pos + 1..].strip_suffix(']');
+                        if subscript_expr.is_none() {
+                            continue;
+                        }
+                        let sub_expr = subscript_expr.unwrap();
+
+                        // Build the expression "name_part op_base expr_part"
+                        // and evaluate it
+                        let computed_expr = format!(
+                            "{} {} ({})",
+                            name_part, _op_base, expr_part
+                        );
+                        let new_val =
+                            self.eval_expr(&computed_expr, line_no)?;
+
+                        // Now do subscript assignment
+                        // Get the container, set the element
+                        let idx_val =
+                            self.eval_expr(sub_expr, line_no)?;
+                        let container =
+                            self.get_var(var_name).cloned().ok_or_else(
+                                || {
+                                    line_error(
+                                        line_no,
+                                        &format!(
+                                            "name '{}' is not defined",
+                                            var_name
+                                        ),
+                                    )
+                                },
+                            )?;
+                        match container {
+                            Value::List(mut items) => {
+                                let i = idx_val.to_int(line_no)?;
+                                let i = if i < 0 {
+                                    (items.len() as i64 + i) as usize
+                                } else {
+                                    i as usize
+                                };
+                                if i < items.len() {
+                                    items[i] = new_val;
+                                    self.set_var(var_name, Value::List(items));
+                                    return Ok(Some(()));
+                                }
+                                return Err(line_error(
+                                    line_no,
+                                    "list index out of range",
+                                ));
+                            }
+                            Value::Dict(mut map) => {
+                                let key = match &idx_val {
+                                    Value::Text(s) => s.clone(),
+                                    Value::Number(n) => {
+                                        format!("{}", *n as i64)
+                                    }
+                                    other => other.to_script_string(),
+                                };
+                                map.insert(key, new_val);
+                                self.set_var(
+                                    var_name,
+                                    Value::Dict(map),
+                                );
+                                return Ok(Some(()));
+                            }
+                            _ => {
+                                return Err(line_error(
+                                    line_no,
+                                    "subscript assignment requires list or dict",
+                                ))
+                            }
+                        }
+                    } else {
+                        // Simple variable name
+                        if !name_part
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            continue;
+                        }
+                        // Build the expression: "current_value op_base expr_part"
+                        let current =
+                            self.get_var(name_part).cloned().ok_or_else(
+                                || {
+                                    line_error(
+                                        line_no,
+                                        &format!(
+                                            "name '{}' is not defined",
+                                            name_part
+                                        ),
+                                    )
+                                },
+                            )?;
+                        let current_str = current.to_script_string();
+                        let computed_expr = format!(
+                            "{} {} ({})",
+                            current_str, _op_base, expr_part
+                        );
+                        let new_val =
+                            self.eval_expr(&computed_expr, line_no)?;
+                        self.set_var(name_part, new_val);
+                        return Ok(Some(()));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn execute_statement<F, V>(
         &mut self,
         text: &str,
         line_no: usize,
         runner: &mut Runner,
         log: &mut F,
+        vars_cb: &mut V,
     ) -> Result<(), RunError>
     where
         F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
     {
+        // pass statement (no-op)
+        if text == "pass" || text.trim() == "pass" {
+            return Ok(());
+        }
+
+        // assert statement
+        if let Some(expr) = text.strip_prefix("assert ") {
+            let expr = expr.trim();
+            // Check for optional message after comma
+            let (cond_expr, msg) = if let Some(pos) = find_comma_outside(expr) {
+                (&expr[..pos], expr[pos + 1..].trim())
+            } else {
+                (expr, "")
+            };
+            let val = self.eval_expr(cond_expr, line_no)?;
+            if !val.as_bool() {
+                let err_msg = if msg.is_empty() {
+                    "assertion error".to_string()
+                } else {
+                    self.eval_expr(msg, line_no)?.to_script_string()
+                };
+                return Err(line_error(line_no, &format!("AssertionError: {err_msg}")));
+            }
+            return Ok(());
+        }
+
+        // del statement
+        if let Some(target) = text.strip_prefix("del ") {
+            let target = target.trim();
+            if target.contains('[') {
+                self.del_subscript(target, line_no)?;
+            } else {
+                self.del_var(target, line_no)?;
+            }
+            return Ok(());
+        }
+
+        // raise statement
+        if let Some(rest) = text.strip_prefix("raise ") {
+            let rest = rest.trim();
+            let (exc_type, err_msg) = if rest.is_empty() {
+                ("RuntimeError".to_string(), "raised error".to_string())
+            } else {
+                let exc_types = ["ValueError", "TypeError", "RuntimeError", "Exception", "KeyError", "IndexError"];
+                let mut found = None;
+                for exc in &exc_types {
+                    if let Some(args) = call_args(rest, exc) {
+                        let vals = split_args(args)
+                            .into_iter()
+                            .map(|arg| self.eval_expr(&arg, line_no))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        found = Some((exc.to_string(), vals.iter().map(|v| v.to_script_string()).collect::<Vec<_>>().join(" ")));
+                        break;
+                    }
+                }
+                match found {
+                    Some((t, m)) => (t, m),
+                    None => ("RuntimeError".to_string(), self.eval_expr(rest, line_no)?.to_script_string()),
+                }
+            };
+            return Err(line_error(line_no, &format!("{exc_type}: {err_msg}")));
+        }
+
+        // Augmented assignment: +=, -=, *=, /=, //=, **=, %=
+        if self.try_augmented_assignment(text, line_no)?.is_some() {
+            return Ok(());
+        }
+
         if let Some(args) = call_args(text, "print") {
             let values = split_args(args)
                 .into_iter()
@@ -585,6 +1027,36 @@ impl ScriptInterpreter {
                 .collect::<Result<Vec<_>, _>>()?;
             log(values.join(" "));
             return Ok(());
+        }
+
+        // Tuple unpacking: a, b = expr1, expr2
+        if let Some(eq_pos) = find_eq_outside(text) {
+            let left = text[..eq_pos].trim();
+            let right = text[eq_pos + 1..].trim();
+            if left.contains(',') && !left.contains('[') && !left.contains('(') {
+                let var_names: Vec<&str> = left.split(',').map(|s| s.trim()).collect();
+                if var_names.iter().all(|v| !v.is_empty() && v.chars().all(|c| c.is_alphanumeric() || c == '_')) {
+                    let values: Vec<Value> = if right.contains(',') && !right.starts_with('[') && !right.starts_with('(') && !right.starts_with('{') {
+                        // Right side is comma-separated expressions: a, b = 1, 2
+                        split_args(right).into_iter().map(|arg| self.eval_expr(arg.trim(), line_no)).collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        // Right side is a single expression evaluating to iterable
+                        let val = self.eval_expr(right, line_no)?;
+                        match val {
+                            Value::Tuple(items) => items,
+                            Value::List(items) => items,
+                            _ => return Err(line_error(line_no, "cannot unpack non-iterable")),
+                        }
+                    };
+                    if var_names.len() != values.len() {
+                        return Err(line_error(line_no, &format!("too many values to unpack (expected {}, got {})", var_names.len(), values.len())));
+                    }
+                    for (name, value) in var_names.into_iter().zip(values) {
+                        self.set_var(name, value);
+                    }
+                    return Ok(());
+                }
+            }
         }
 
         if let Some((name, expr)) = split_assignment(text) {
@@ -599,7 +1071,7 @@ impl ScriptInterpreter {
                     .into_iter()
                     .map(|arg| self.eval_expr(&arg, line_no))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.call_function(name, evaluated, runner, log, line_no)?;
+                self.call_function(name, evaluated, runner, log, vars_cb, line_no)?;
                 return Ok(());
             }
 
@@ -611,16 +1083,18 @@ impl ScriptInterpreter {
         self.run_command_line(&command_line, line_no, runner, log)
     }
 
-    fn call_function<F>(
+    fn call_function<F, V>(
         &mut self,
         name: &str,
         args: Vec<Value>,
         runner: &mut Runner,
         log: &mut F,
+        vars_cb: &mut V,
         line_no: usize,
     ) -> Result<(), RunError>
     where
         F: FnMut(String),
+        V: FnMut(Vec<(String, String)>),
     {
         let Some(function) = self.functions.get(name).copied() else {
             return Err(line_error(line_no, "unknown function"));
@@ -635,7 +1109,7 @@ impl ScriptInterpreter {
             self.set_var(param, value);
         }
 
-        let result = self.execute_block(function.body_start, function.body_end, runner, log);
+        let result = self.execute_block(function.body_start, function.body_end, runner, log, vars_cb);
         self.scopes.pop();
 
         match result? {
@@ -656,7 +1130,7 @@ impl ScriptInterpreter {
         }
     }
 
-    fn parse_for(&mut self, text: &str, line_no: usize) -> Result<(String, ForRange), RunError> {
+    fn parse_for(&mut self, text: &str, line_no: usize) -> Result<(String, ForIter), RunError> {
         let body = text
             .strip_prefix("for ")
             .and_then(|value| value.strip_suffix(':'))
@@ -664,33 +1138,44 @@ impl ScriptInterpreter {
         let Some((var, range_expr)) = body.split_once(" in ") else {
             return Err(line_error(
                 line_no,
-                "for statement format: for i in range(...):",
+                "for statement format: for i in range(...): or for i in expr:",
             ));
         };
-        let args = call_args(range_expr.trim(), "range")
-            .ok_or_else(|| line_error(line_no, "for currently supports range(...)"))?;
-        let nums = split_args(args)
-            .into_iter()
-            .map(|arg| self.eval_number(&arg, line_no).map(|value| value as i64))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (start, stop, step) = match nums.as_slice() {
-            [stop] => (0, *stop, 1),
-            [start, stop] => (*start, *stop, 1),
-            [start, stop, step] => (*start, *stop, *step),
-            _ => return Err(line_error(line_no, "range supports 1 to 3 arguments")),
-        };
-        if step == 0 {
-            return Err(line_error(line_no, "range step cannot be 0"));
+        let range_expr = range_expr.trim();
+        // Try range() first
+        if let Some(args) = call_args(range_expr, "range") {
+            let nums = split_args(args)
+                .into_iter()
+                .map(|arg| self.eval_number(&arg, line_no).map(|value| value as i64))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (start, stop, step) = match nums.as_slice() {
+                [stop] => (0, *stop, 1),
+                [start, stop] => (*start, *stop, 1),
+                [start, stop, step] => (*start, *stop, *step),
+                _ => return Err(line_error(line_no, "range supports 1 to 3 arguments")),
+            };
+            if step == 0 {
+                return Err(line_error(line_no, "range step cannot be 0"));
+            }
+            return Ok((
+                var.trim().to_string(),
+                ForIter::Range(ForRange {
+                    current: start,
+                    stop,
+                    step,
+                }),
+            ));
         }
-
-        Ok((
-            var.trim().to_string(),
-            ForRange {
-                current: start,
-                stop,
-                step,
-            },
-        ))
+        // For-in iteration over list/str/dict/tuple
+        let iterable = self.eval_expr(range_expr, line_no)?;
+        let values = match iterable {
+            Value::List(items) => items,
+            Value::Tuple(items) => items,
+            Value::Text(s) => s.chars().map(|c| Value::Text(c.to_string())).collect(),
+            Value::Dict(map) => map.into_keys().map(Value::Text).collect(),
+            _ => return Err(line_error(line_no, "for-in requires a list, tuple, string, or dict")),
+        };
+        Ok((var.trim().to_string(), ForIter::Values(values)))
     }
 
     fn command_from_call(
@@ -757,7 +1242,7 @@ impl ScriptInterpreter {
         match self.eval_expr(expr, line_no)? {
             Value::Number(value) => Ok(value),
             Value::Bool(value) => Ok(if value { 1.0 } else { 0.0 }),
-            Value::Text(_) | Value::List(_) => Err(line_error(line_no, "number expression expected")),
+            _ => Err(line_error(line_no, "number expression expected")),
         }
     }
 
@@ -771,17 +1256,135 @@ impl ScriptInterpreter {
         }
     }
 
+    fn del_var(&mut self, name: &str, line_no: usize) -> Result<(), RunError> {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.remove(name).is_some() {
+                return Ok(());
+            }
+        }
+        Err(line_error(line_no, &format!("cannot delete '{name}': name not defined")))
+    }
+
+    fn del_subscript(&mut self, target: &str, line_no: usize) -> Result<(), RunError> {
+        // Find the last [ to split container and index
+        let bracket_pos = target.rfind('[').ok_or_else(|| {
+            line_error(line_no, &format!("invalid del target: {target}"))
+        })?;
+        let container_expr = &target[..bracket_pos];
+        let index_expr = target[bracket_pos + 1..].strip_suffix(']').ok_or_else(|| {
+            line_error(line_no, &format!("invalid subscript in del: {target}"))
+        })?;
+        let index_val = self.eval_expr(index_expr, line_no)?;
+        // Get the container variable name (simple case: varname)
+        if container_expr.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            let container = self.get_var(container_expr).cloned().ok_or_else(|| {
+                line_error(line_no, &format!("name '{}' is not defined", container_expr))
+            })?;
+            match container {
+                Value::List(mut items) => {
+                    let idx = index_val.to_int(line_no)?;
+                    let idx = if idx < 0 {
+                        (items.len() as i64 + idx) as usize
+                    } else {
+                        idx as usize
+                    };
+                    if idx < items.len() {
+                        items.remove(idx);
+                        self.set_var(container_expr, Value::List(items));
+                        return Ok(());
+                    }
+                    Err(line_error(line_no, "list index out of range in del"))
+                }
+                Value::Dict(mut map) => {
+                    let key = match &index_val {
+                        Value::Text(s) => s.clone(),
+                        Value::Number(n) => format!("{}", *n as i64),
+                        other => other.to_script_string(),
+                    };
+                    map.remove(&key);
+                    self.set_var(container_expr, Value::Dict(map));
+                    Ok(())
+                }
+                _ => Err(line_error(line_no, "cannot delete subscript of this type")),
+            }
+        } else {
+            Err(line_error(line_no, &format!("complex del target not supported: {target}")))
+        }
+    }
+
     fn eval_expr(&mut self, expr: &str, line_no: usize) -> Result<Value, RunError> {
         let expr = expr.trim();
         if expr.is_empty() {
             return Err(line_error(line_no, "empty expression"));
         }
 
-        // List literal: [item1, item2, ...]
+        // None literal
+        if expr == "None" {
+            return Ok(Value::None);
+        }
+
+        // Tuple literal: (a, b, c) or single item (a,)
+        if expr.starts_with('(') && expr.ends_with(')') {
+            let inner = &expr[1..expr.len() - 1];
+            if inner.trim().is_empty() {
+                return Ok(Value::Tuple(Vec::new()));
+            }
+            let items = split_args(inner);
+            if items.len() == 1 && !inner.trim().ends_with(',') {
+                // Grouped expression like (1 + 2)
+                return self.eval_expr(&items[0], line_no);
+            }
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(self.eval_expr(&item, line_no)?);
+            }
+            return Ok(Value::Tuple(values));
+        }
+
+        // List literal: [item1, item2, ...]  or  list comprehension: [expr for var in iterable]
         if expr.starts_with('[') && expr.ends_with(']') {
             let inner = &expr[1..expr.len() - 1];
             if inner.trim().is_empty() {
                 return Ok(Value::List(Vec::new()));
+            }
+            // Check for list comprehension: contains " for " outside brackets/quotes
+            if let Some(for_pos) = find_keyword_outside(inner, " for ") {
+                let output_expr = inner[..for_pos].trim();
+                let rest = inner[for_pos + 5..].trim(); // after " for "
+                // Parse: var in iterable [if condition]
+                let in_pos = find_keyword_outside(rest, " in ")
+                    .ok_or_else(|| line_error(line_no, "list comprehension: expected 'in'"))?;
+                let var_name = rest[..in_pos].trim();
+                let iter_rest = rest[in_pos + 4..].trim();
+                // Check for optional "if" condition
+                let (iter_expr, filter_expr) = if let Some(if_pos) = find_keyword_outside(iter_rest, " if ") {
+                    (&iter_rest[..if_pos], Some(iter_rest[if_pos + 4..].trim()))
+                } else {
+                    (iter_rest, None)
+                };
+                // Evaluate the iterable
+                let iterable = self.eval_expr(iter_expr, line_no)?;
+                let items: Vec<Value> = match &iterable {
+                    Value::List(items) => items.clone(),
+                    Value::Tuple(items) => items.clone(),
+                    Value::Text(s) => s.chars().map(|c| Value::Text(c.to_string())).collect(),
+                    _ => return Err(line_error(line_no, "list comprehension requires an iterable")),
+                };
+                // Push a scope for the loop variable
+                self.scopes.push(HashMap::new());
+                let mut result = Vec::new();
+                for item in items {
+                    self.set_var(var_name, item);
+                    // Check filter condition
+                    if let Some(cond) = filter_expr {
+                        if !self.eval_expr(cond, line_no)?.as_bool() {
+                            continue;
+                        }
+                    }
+                    result.push(self.eval_expr(output_expr, line_no)?);
+                }
+                self.scopes.pop();
+                return Ok(Value::List(result));
             }
             let items = split_args(inner);
             let mut values = Vec::with_capacity(items.len());
@@ -791,48 +1394,112 @@ impl ScriptInterpreter {
             return Ok(Value::List(values));
         }
 
-        // Subscript access: name[index]
+        // Dict literal: {key: value, ...}
+        if expr.starts_with('{') && expr.ends_with('}') {
+            let inner = &expr[1..expr.len() - 1];
+            if inner.trim().is_empty() {
+                return Ok(Value::Dict(HashMap::new()));
+            }
+            let pairs = split_args(inner);
+            let mut map = HashMap::new();
+            for pair in pairs {
+                let (key_str, val_str) = pair.split_once(':')
+                    .ok_or_else(|| line_error(line_no, "dict item must be key: value"))?;
+                let key = self.eval_expr(key_str.trim(), line_no)?;
+                let key_text = match key {
+                    Value::Text(s) => s,
+                    Value::Number(n) => format!("{}", n as i64),
+                    Value::Bool(b) => b.to_string(),
+                    _ => return Err(line_error(line_no, "dict key must be string or number")),
+                };
+                let val = self.eval_expr(val_str.trim(), line_no)?;
+                map.insert(key_text, val);
+            }
+            return Ok(Value::Dict(map));
+        }
+
+        // Slice: name[start:stop] or name[start:stop:step] (check before simple subscript)
         if let Some(bracket_start) = expr.rfind('[') {
             if expr.ends_with(']') {
                 let name = &expr[..bracket_start];
-                let index_expr = &expr[bracket_start + 1..expr.len() - 1];
-                if !name.is_empty() && !index_expr.is_empty() {
+                let inner = &expr[bracket_start + 1..expr.len() - 1];
+                if !name.is_empty() && !inner.is_empty() {
+                    if inner.contains(':') {
+                        let container = self.eval_expr(name, line_no)?;
+                        return Ok(self.eval_slice(&container, inner, line_no)?);
+                    }
+                    // Simple subscript with negative index support
                     let container = self.eval_expr(name, line_no)?;
-                    let index_val = self.eval_expr(index_expr, line_no)?;
-                    return match container {
-                        Value::List(items) => {
-                            let idx = index_val.to_int(line_no)? as usize;
-                            if idx < items.len() {
-                                Ok(items[idx].clone())
-                            } else {
-                                Err(line_error(line_no, &format!("list index {idx} out of range (len={})", items.len())))
-                            }
-                        }
-                        Value::Text(s) => {
-                            let idx = index_val.to_int(line_no)? as usize;
-                            if idx < s.len() {
-                                Ok(Value::Text(s.chars().nth(idx).unwrap().to_string()))
-                            } else {
-                                Err(line_error(line_no, &format!("string index {idx} out of range (len={})", s.len())))
-                            }
-                        }
-                        _ => Err(line_error(line_no, "subscript requires a list or string")),
-                    };
+                    let index_val = self.eval_expr(inner, line_no)?;
+                    return self.eval_subscript(&container, &index_val, line_no);
                 }
             }
         }
 
+        // F-string
         if let Some(template) = parse_f_string(expr) {
             return Ok(Value::Text(self.eval_f_string(template, line_no)?));
         }
+        // Quoted string
         if let Some(value) = parse_quoted(expr) {
             return Ok(Value::Text(value));
         }
-        if let Some((name, args)) = parse_call(expr) {
-            if let Some(value) = self.eval_builtin(name, args, line_no)? {
-                return Ok(value);
+
+        // Ternary: value if condition else other
+        // Must be checked carefully - find " if " then " else " outside quotes/parens
+        if let Some(ternary) = self.parse_ternary(expr) {
+            let (true_expr, cond_expr, false_expr) = ternary;
+            let cond = self.eval_expr(cond_expr, line_no)?;
+            if cond.as_bool() {
+                return self.eval_expr(true_expr, line_no);
+            } else {
+                return self.eval_expr(false_expr, line_no);
             }
         }
+
+        // Boolean operators: or (lowest precedence), then and
+        if let Some((left, right)) = split_outside(expr, " or ") {
+            let left_val = self.eval_expr(left, line_no)?;
+            if left_val.as_bool() { return Ok(left_val); }
+            return self.eval_expr(right, line_no);
+        }
+        if let Some((left, right)) = split_outside(expr, " and ") {
+            let left_val = self.eval_expr(left, line_no)?;
+            if !left_val.as_bool() { return Ok(left_val); }
+            return self.eval_expr(right, line_no);
+        }
+
+        // not operator (unary prefix)
+        if let Some(rest) = expr.strip_prefix("not ") {
+            let val = self.eval_expr(rest.trim(), line_no)?;
+            return Ok(Value::Bool(!val.as_bool()));
+        }
+
+        // in / not in operators
+        if let Some((left, right)) = split_outside(expr, " not in ") {
+            let left_val = self.eval_expr(left, line_no)?;
+            let right_val = self.eval_expr(right, line_no)?;
+            return Ok(Value::Bool(!value_contains(&right_val, &left_val)));
+        }
+        if let Some((left, right)) = split_outside(expr, " in ") {
+            let left_val = self.eval_expr(left, line_no)?;
+            let right_val = self.eval_expr(right, line_no)?;
+            return Ok(Value::Bool(value_contains(&right_val, &left_val)));
+        }
+
+        // is / is not operators
+        if let Some((left, right)) = split_outside(expr, " is not ") {
+            let left_val = self.eval_expr(left, line_no)?;
+            let right_val = self.eval_expr(right, line_no)?;
+            return Ok(Value::Bool(!values_equal(&left_val, &right_val)));
+        }
+        if let Some((left, right)) = split_outside(expr, " is ") {
+            let left_val = self.eval_expr(left, line_no)?;
+            let right_val = self.eval_expr(right, line_no)?;
+            return Ok(Value::Bool(values_equal(&left_val, &right_val)));
+        }
+
+        // Comparison operators
         for op in ["==", "!=", ">=", "<=", ">", "<"] {
             if let Some((left, right)) = split_outside(expr, op) {
                 let left = self.eval_expr(left, line_no)?;
@@ -840,19 +1507,1003 @@ impl ScriptInterpreter {
                 return Ok(Value::Bool(compare_values(&left, &right, op)));
             }
         }
-        if let Some(value) = self.eval_arithmetic(expr, line_no)? {
-            return Ok(Value::Number(value));
+
+        // Binary operators with string/list operations
+        // + : string concat, list concat, numeric add
+        if let Some((left, op, right)) = split_last_operator(expr, &["+", "-"]) {
+            if op == "+" {
+                let left_res = self.eval_expr(left, line_no);
+                let right_res = self.eval_expr(right, line_no);
+                // String concatenation
+                if let (Ok(Value::Text(ref a)), Ok(Value::Text(ref b))) = (&left_res, &right_res) {
+                    return Ok(Value::Text(format!("{a}{b}")));
+                }
+                // List concatenation
+                if let (Ok(Value::List(ref a)), Ok(Value::List(ref b))) = (&left_res, &right_res) {
+                    return Ok(Value::List([&a[..], &b[..]].concat()));
+                }
+                // Numeric add
+                let left_num = left_res?.to_float(line_no)?;
+                let right_num = right_res?.to_float(line_no)?;
+                return Ok(Value::Number(left_num + right_num));
+            }
+            // Subtraction (numeric only)
+            let left_num = self.eval_number(left, line_no)?;
+            let right_num = self.eval_number(right, line_no)?;
+            return Ok(Value::Number(left_num - right_num));
         }
+
+        // * / % // : string repeat, list repeat, numeric ops
+        if let Some((left, op, right)) = split_last_operator(expr, &["//", "%", "/", "*"]) {
+            // Check for string/list * number
+            if op == "*" {
+                let left_res = self.eval_expr(left, line_no);
+                let right_res = self.eval_expr(right, line_no);
+                match (&left_res, &right_res) {
+                    (Ok(Value::Text(ref s)), Ok(Value::Number(n))) => {
+                        let count = (*n as i64).max(0) as usize;
+                        return Ok(Value::Text(s.repeat(count)));
+                    }
+                    (Ok(Value::Number(n)), Ok(Value::Text(ref s))) => {
+                        let count = (*n as i64).max(0) as usize;
+                        return Ok(Value::Text(s.repeat(count)));
+                    }
+                    (Ok(Value::List(ref items)), Ok(Value::Number(n))) => {
+                        let count = (*n as i64).max(0) as usize;
+                        let cloned: Vec<Value> = items.iter().cloned().collect();
+                        let mut result = Vec::new();
+                        for _ in 0..count {
+                            result.extend(items.iter().cloned());
+                        }
+                        return Ok(Value::List(result));
+                    }
+                    _ => {}
+                }
+            }
+            // Numeric operations
+            let left_num = self.eval_number(left, line_no)?;
+            let right_num = self.eval_number(right, line_no)?;
+            let result = match op {
+                "//" => (left_num / right_num).floor(),
+                "%" => left_num % right_num,
+                "/" => left_num / right_num,
+                _ => left_num * right_num,
+            };
+            return Ok(Value::Number(result));
+        }
+
+        // ** power (right-to-left)
+        if let Some((left, _, right)) = split_first_operator(expr, &["**"]) {
+            let left_num = self.eval_number(left, line_no)?;
+            let right_num = self.eval_number(right, line_no)?;
+            return Ok(Value::Number(left_num.powf(right_num)));
+        }
+
+        // Unary minus
+        if let Some(rest) = expr.strip_prefix('-') {
+            if let Ok(value) = rest.parse::<f64>() {
+                return Ok(Value::Number(-value));
+            }
+            if let Some(var_val) = self.get_var(rest.trim()) {
+                if let Value::Number(n) = var_val {
+                    return Ok(Value::Number(-n));
+                }
+            }
+            let val = self.eval_expr(rest.trim(), line_no)?;
+            return Ok(Value::Number(-val.to_float(line_no)?));
+        }
+
+        // Method call: obj.method(args)
+        if let Some(dot_pos) = find_dot_method(expr) {
+            let obj_expr = &expr[..dot_pos];
+            let rest = &expr[dot_pos + 1..];
+            if let Some((method, args_str)) = parse_call(rest) {
+                let obj = self.eval_expr(obj_expr, line_no)?;
+                let evaluated = split_args(args_str)
+                    .into_iter()
+                    .map(|arg| self.eval_expr(&arg, line_no))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return self.call_method(&obj, method, evaluated, line_no);
+            }
+        }
+
+        // Built-in function call
+        if let Some((name, args)) = parse_call(expr) {
+            if let Some(value) = self.eval_builtin(name, args, line_no)? {
+                return Ok(value);
+            }
+            // User-defined function call as expression
+            if self.functions.contains_key(name) {
+                let evaluated = split_args(args)
+                    .into_iter()
+                    .map(|arg| self.eval_expr(&arg, line_no))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return self.call_function_expr(name, evaluated, line_no);
+            }
+        }
+
+        // Variable lookup
         if let Some(value) = self.get_var(expr) {
             return Ok(value.clone());
         }
+
+        // Boolean literals
         if expr.eq_ignore_ascii_case("true") {
             return Ok(Value::Bool(true));
         }
         if expr.eq_ignore_ascii_case("false") {
             return Ok(Value::Bool(false));
         }
+
+        // Number literal
+        if let Ok(value) = expr.parse::<f64>() {
+            return Ok(Value::Number(value));
+        }
+
+        // Fallback: treat as string
         Ok(Value::Text(expr.to_string()))
+    }
+
+    fn parse_ternary<'a>(&self, expr: &'a str) -> Option<(&'a str, &'a str, &'a str)> {
+        // Find " if " outside quotes/parens, then " else " after it
+        let if_pos = find_keyword_outside(expr, " if ")?;
+        let true_expr = &expr[..if_pos];
+        let rest = &expr[if_pos + 4..];
+        let else_pos = find_keyword_outside(rest, " else ")?;
+        let cond = &rest[..else_pos];
+        let false_expr = &rest[else_pos + 6..];
+        Some((true_expr, cond, false_expr))
+    }
+
+    fn eval_subscript(&self, container: &Value, index: &Value, line_no: usize) -> Result<Value, RunError> {
+        match container {
+            Value::List(items) => {
+                let idx_raw = index.to_int(line_no)?;
+                let idx = if idx_raw < 0 {
+                    (items.len() as i64 + idx_raw) as usize
+                } else {
+                    idx_raw as usize
+                };
+                if idx < items.len() {
+                    Ok(items[idx].clone())
+                } else {
+                    Err(line_error(line_no, &format!("list index out of range (idx={}, len={})", idx, items.len())))
+                }
+            }
+            Value::Tuple(items) => {
+                let idx_raw = index.to_int(line_no)?;
+                let idx = if idx_raw < 0 {
+                    (items.len() as i64 + idx_raw) as usize
+                } else {
+                    idx_raw as usize
+                };
+                if idx < items.len() {
+                    Ok(items[idx].clone())
+                } else {
+                    Err(line_error(line_no, &format!("tuple index out of range")))
+                }
+            }
+            Value::Text(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                let idx_raw = index.to_int(line_no)?;
+                let idx = if idx_raw < 0 {
+                    (chars.len() as i64 + idx_raw) as usize
+                } else {
+                    idx_raw as usize
+                };
+                if idx < chars.len() {
+                    Ok(Value::Text(chars[idx].to_string()))
+                } else {
+                    Err(line_error(line_no, &format!("string index out of range")))
+                }
+            }
+            Value::Dict(map) => {
+                let key = match index {
+                    Value::Text(s) => s.clone(),
+                    Value::Number(n) => format!("{}", *n as i64),
+                    other => other.to_script_string(),
+                };
+                map.get(&key).cloned().ok_or_else(|| line_error(line_no, &format!("key error: {key}")))
+            }
+            _ => Err(line_error(line_no, "subscript requires a list, tuple, string, or dict")),
+        }
+    }
+
+    fn eval_slice(&mut self, container: &Value, inner: &str, line_no: usize) -> Result<Value, RunError> {
+        let parts: Vec<&str> = inner.split(':').collect();
+        let len = match container {
+            Value::List(items) => items.len(),
+            Value::Text(s) => s.chars().count(),
+            Value::Tuple(items) => items.len(),
+            _ => return Err(line_error(line_no, "slice requires a list, string, or tuple")),
+        };
+
+        let start = if let Some(s) = parts.get(0) {
+            let s = s.trim();
+            if s.is_empty() { 0i64 } else { self.eval_expr(s, line_no)?.to_int(line_no)? }
+        } else { 0 };
+        let stop = if let Some(s) = parts.get(1) {
+            let s = s.trim();
+            if s.is_empty() { len as i64 } else { self.eval_expr(s, line_no)?.to_int(line_no)? }
+        } else { len as i64 };
+        let step = if let Some(s) = parts.get(2) {
+            let s = s.trim();
+            if s.is_empty() { 1i64 } else { self.eval_expr(s, line_no)?.to_int(line_no)? }
+        } else { 1 };
+
+        if step == 0 { return Err(line_error(line_no, "slice step cannot be 0")); }
+
+        let len_i = len as i64;
+        let (start, stop) = if step > 0 {
+            let s = if start < 0 { (len_i + start).max(0) } else { start.min(len_i) };
+            let e = if stop < 0 { (len_i + stop).max(0) } else { stop.min(len_i) };
+            (s as usize, e.max(s) as i64)
+        } else {
+            let s = if start < 0 { (len_i + start).max(-1) } else { start.min(len_i - 1) };
+            let e = if stop < 0 { (len_i + stop).max(-1) } else { stop };
+            (s.max(0) as usize, e.max(-1) as i64)
+        };
+
+        let stop_usize = stop as usize;
+        match container {
+            Value::List(items) => {
+                let indices: Vec<usize> = if step > 0 {
+                    (start..stop_usize).step_by(step as usize).filter(|&i| i < items.len()).collect()
+                } else {
+                    let mut v = Vec::new();
+                    let mut i = start as i64;
+                    while i > stop {
+                        if i >= 0 && (i as usize) < items.len() { v.push(i as usize); }
+                        i += step;
+                    }
+                    v
+                };
+                Ok(Value::List(indices.into_iter().map(|i| items[i].clone()).collect()))
+            }
+            Value::Text(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                let indices: Vec<usize> = if step > 0 {
+                    (start..stop_usize).step_by(step as usize).filter(|&i| i < chars.len()).collect()
+                } else {
+                    let mut v = Vec::new();
+                    let mut i = start as i64;
+                    while i > stop {
+                        if i >= 0 && (i as usize) < chars.len() { v.push(i as usize); }
+                        i += step;
+                    }
+                    v
+                };
+                Ok(Value::Text(indices.into_iter().map(|i| chars[i]).collect()))
+            }
+            Value::Tuple(items) => {
+                let indices: Vec<usize> = if step > 0 {
+                    (start..stop_usize).step_by(step as usize).filter(|&i| i < items.len()).collect()
+                } else {
+                    let mut v = Vec::new();
+                    let mut i = start as i64;
+                    while i > stop {
+                        if i >= 0 && (i as usize) < items.len() { v.push(i as usize); }
+                        i += step;
+                    }
+                    v
+                };
+                Ok(Value::Tuple(indices.into_iter().map(|i| items[i].clone()).collect()))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn call_function_expr(&mut self, name: &str, args: Vec<Value>, line_no: usize) -> Result<Value, RunError> {
+        let function = self.functions.get(name).copied()
+            .ok_or_else(|| line_error(line_no, "unknown function"))?;
+        let params = parse_def_params(&self.lines[function.body_start - 1].text)?;
+        if params.len() != args.len() {
+            return Err(line_error(line_no, &format!("{}() expects {} args, got {}", name, params.len(), args.len())));
+        }
+
+        self.scopes.push(HashMap::new());
+        for (param, value) in params.iter().zip(args) {
+            self.set_var(param, value);
+        }
+
+        // Execute function body without runner
+        let result = self.execute_block_no_runner(function.body_start, function.body_end);
+        self.scopes.pop();
+
+        match result {
+            Ok(Flow::Return(value)) => Ok(value),
+            Ok(Flow::Continue) | Ok(Flow::Break) | Ok(Flow::ContinueLoop) => Ok(Value::None),
+            Ok(Flow::Goto(_)) => Ok(Value::None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn call_method(&self, obj: &Value, method: &str, args: Vec<Value>, line_no: usize) -> Result<Value, RunError> {
+        match obj {
+            Value::Text(s) => self.call_str_method(s, method, args, line_no),
+            Value::List(items) => self.call_list_method(items, method, args, line_no),
+            Value::Dict(map) => self.call_dict_method(map, method, args, line_no),
+            _ => Err(line_error(line_no, &format!("{} has no method '{}'", obj.type_name(), method))),
+        }
+    }
+
+    fn call_str_method(&self, s: &str, method: &str, args: Vec<Value>, line_no: usize) -> Result<Value, RunError> {
+        match method {
+            "upper" => {
+                if !args.is_empty() { return Err(line_error(line_no, "upper() takes no arguments")); }
+                Ok(Value::Text(s.to_uppercase()))
+            }
+            "lower" => {
+                if !args.is_empty() { return Err(line_error(line_no, "lower() takes no arguments")); }
+                Ok(Value::Text(s.to_lowercase()))
+            }
+            "strip" => {
+                if !args.is_empty() { return Err(line_error(line_no, "strip() takes no arguments")); }
+                Ok(Value::Text(s.trim().to_string()))
+            }
+            "lstrip" => {
+                if !args.is_empty() { return Err(line_error(line_no, "lstrip() takes no arguments")); }
+                Ok(Value::Text(s.trim_start().to_string()))
+            }
+            "rstrip" => {
+                if !args.is_empty() { return Err(line_error(line_no, "rstrip() takes no arguments")); }
+                Ok(Value::Text(s.trim_end().to_string()))
+            }
+            "split" => {
+                let parts = if args.is_empty() {
+                    s.split_whitespace().map(|p| Value::Text(p.to_string())).collect()
+                } else if args.len() == 1 {
+                    let sep = args[0].to_script_string();
+                    s.split(&sep).map(|p| Value::Text(p.to_string())).collect()
+                } else {
+                    return Err(line_error(line_no, "split() takes at most 1 argument"));
+                };
+                Ok(Value::List(parts))
+            }
+            "replace" => {
+                if args.len() != 2 { return Err(line_error(line_no, "replace() requires 2 arguments")); }
+                let old = args[0].to_script_string();
+                let new = args[1].to_script_string();
+                Ok(Value::Text(s.replace(&old, &new)))
+            }
+            "find" => {
+                if args.is_empty() { return Err(line_error(line_no, "find() requires at least 1 argument")); }
+                let substr = args[0].to_script_string();
+                let pos = s.find(&substr).map(|i| i as i64).unwrap_or(-1);
+                Ok(Value::Number(pos as f64))
+            }
+            "rfind" => {
+                if args.is_empty() { return Err(line_error(line_no, "rfind() requires at least 1 argument")); }
+                let substr = args[0].to_script_string();
+                let pos = s.rfind(&substr).map(|i| i as i64).unwrap_or(-1);
+                Ok(Value::Number(pos as f64))
+            }
+            "startswith" => {
+                if args.len() != 1 { return Err(line_error(line_no, "startswith() requires 1 argument")); }
+                let prefix = args[0].to_script_string();
+                Ok(Value::Bool(s.starts_with(&prefix)))
+            }
+            "endswith" => {
+                if args.len() != 1 { return Err(line_error(line_no, "endswith() requires 1 argument")); }
+                let suffix = args[0].to_script_string();
+                Ok(Value::Bool(s.ends_with(&suffix)))
+            }
+            "count" => {
+                if args.len() != 1 { return Err(line_error(line_no, "count() requires 1 argument")); }
+                let substr = args[0].to_script_string();
+                Ok(Value::Number(s.matches(&substr).count() as f64))
+            }
+            "join" => {
+                if args.len() != 1 { return Err(line_error(line_no, "join() requires 1 argument")); }
+                let parts: Vec<String> = match &args[0] {
+                    Value::List(items) => items.iter().map(|v| v.to_script_string()).collect(),
+                    Value::Tuple(items) => items.iter().map(|v| v.to_script_string()).collect(),
+                    _ => return Err(line_error(line_no, "join() requires a list or tuple")),
+                };
+                Ok(Value::Text(parts.join(s)))
+            }
+            "isdigit" => { if !args.is_empty() { return Err(line_error(line_no, "isdigit() takes no arguments")); } Ok(Value::Bool(s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty())) }
+            "isalpha" => { if !args.is_empty() { return Err(line_error(line_no, "isalpha() takes no arguments")); } Ok(Value::Bool(s.chars().all(|c| c.is_ascii_alphabetic()) && !s.is_empty())) }
+            "zfill" => {
+                if args.len() != 1 { return Err(line_error(line_no, "zfill() requires 1 argument")); }
+                let width = args[0].to_int(line_no)? as usize;
+                let len = s.chars().count();
+                if len >= width { Ok(Value::Text(s.to_string())) }
+                else { Ok(Value::Text(format!("{}{}", "0".repeat(width - len), s))) }
+            }
+            "center" | "ljust" | "rjust" => {
+                if args.is_empty() || args.len() > 2 { return Err(line_error(line_no, &format!("{method}() takes 1-2 arguments"))); }
+                let width = args[0].to_int(line_no)? as usize;
+                let fill = if args.len() > 1 { args[1].to_script_string() } else { " ".to_string() };
+                let fill_char = fill.chars().next().unwrap_or(' ');
+                let len = s.chars().count();
+                if len >= width { return Ok(Value::Text(s.to_string())); }
+                let total_pad = width - len;
+                let result = match method {
+                    "center" => {
+                        let left = total_pad / 2;
+                        let right = total_pad - left;
+                        format!("{}{}{}", fill_char.to_string().repeat(left), s, fill_char.to_string().repeat(right))
+                    }
+                    "ljust" => format!("{}{}", s, fill_char.to_string().repeat(total_pad)),
+                    "rjust" => format!("{}{}", fill_char.to_string().repeat(total_pad), s),
+                    _ => unreachable!(),
+                };
+                Ok(Value::Text(result))
+            }
+            _ => Err(line_error(line_no, &format!("str has no method '{}'", method))),
+        }
+    }
+
+    fn call_list_method(&self, items: &Vec<Value>, method: &str, args: Vec<Value>, line_no: usize) -> Result<Value, RunError> {
+        match method {
+            "append" => {
+                if args.len() != 1 { return Err(line_error(line_no, "append() takes 1 argument")); }
+                let mut new_list = items.clone();
+                new_list.push(args.into_iter().next().unwrap());
+                Ok(Value::List(new_list))
+            }
+            "insert" => {
+                if args.len() != 2 { return Err(line_error(line_no, "insert() takes 2 arguments")); }
+                let idx = args[0].to_int(line_no)? as usize;
+                let mut new_list = items.clone();
+                let pos = idx.min(new_list.len());
+                new_list.insert(pos, args.into_iter().nth(1).unwrap());
+                Ok(Value::List(new_list))
+            }
+            "pop" => {
+                if args.len() > 1 { return Err(line_error(line_no, "pop() takes at most 1 argument")); }
+                let mut new_list = items.clone();
+                if new_list.is_empty() { return Err(line_error(line_no, "pop from empty list")); }
+                let idx = if args.is_empty() { new_list.len() - 1 } else { args[0].to_int(line_no)? as usize };
+                if idx >= new_list.len() { return Err(line_error(line_no, "pop index out of range")); }
+                let val = new_list.remove(idx);
+                Ok(val)
+            }
+            "index" => {
+                if args.len() != 1 { return Err(line_error(line_no, "index() takes 1 argument")); }
+                let pos = items.iter().position(|v| values_equal(v, &args[0]));
+                match pos {
+                    Some(i) => Ok(Value::Number(i as f64)),
+                    None => Err(line_error(line_no, "value not in list")),
+                }
+            }
+            "count" => {
+                if args.len() != 1 { return Err(line_error(line_no, "count() takes 1 argument")); }
+                let c = items.iter().filter(|v| values_equal(v, &args[0])).count();
+                Ok(Value::Number(c as f64))
+            }
+            "reverse" => {
+                if !args.is_empty() { return Err(line_error(line_no, "reverse() takes no arguments")); }
+                let mut new_list = items.clone();
+                new_list.reverse();
+                Ok(Value::List(new_list))
+            }
+            "extend" => {
+                if args.len() != 1 { return Err(line_error(line_no, "extend() takes 1 argument")); }
+                let mut new_list = items.clone();
+                match &args[0] {
+                    Value::List(other) => new_list.extend(other.iter().cloned()),
+                    Value::Tuple(other) => new_list.extend(other.iter().cloned()),
+                    _ => return Err(line_error(line_no, "extend() requires a list or tuple")),
+                }
+                Ok(Value::List(new_list))
+            }
+            "sort" => {
+                if !args.is_empty() { return Err(line_error(line_no, "sort() takes no arguments (key not supported)")); }
+                let mut new_list = items.clone();
+                new_list.sort_by(|a, b| {
+                    match (a, b) {
+                        (Value::Number(x), Value::Number(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+                        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                });
+                Ok(Value::List(new_list))
+            }
+            "copy" => {
+                if !args.is_empty() { return Err(line_error(line_no, "copy() takes no arguments")); }
+                Ok(Value::List(items.clone()))
+            }
+            "clear" => {
+                if !args.is_empty() { return Err(line_error(line_no, "clear() takes no arguments")); }
+                Ok(Value::List(Vec::new()))
+            }
+            _ => Err(line_error(line_no, &format!("list has no method '{}'", method))),
+        }
+    }
+
+    fn call_dict_method(&self, map: &HashMap<String, Value>, method: &str, args: Vec<Value>, line_no: usize) -> Result<Value, RunError> {
+        match method {
+            "keys" => {
+                if !args.is_empty() { return Err(line_error(line_no, "keys() takes no arguments")); }
+                Ok(Value::List(map.keys().map(|k| Value::Text(k.clone())).collect()))
+            }
+            "values" => {
+                if !args.is_empty() { return Err(line_error(line_no, "values() takes no arguments")); }
+                Ok(Value::List(map.values().cloned().collect()))
+            }
+            "items" => {
+                if !args.is_empty() { return Err(line_error(line_no, "items() takes no arguments")); }
+                Ok(Value::List(map.iter().map(|(k, v)| Value::Tuple(vec![Value::Text(k.clone()), v.clone()])).collect()))
+            }
+            "get" => {
+                if args.len() < 1 || args.len() > 2 { return Err(line_error(line_no, "get() takes 1-2 arguments")); }
+                let key = args[0].to_script_string();
+                match map.get(&key) {
+                    Some(v) => Ok(v.clone()),
+                    None => Ok(if args.len() > 1 { args[1].clone() } else { Value::None }),
+                }
+            }
+            "pop" => {
+                if args.len() < 1 || args.len() > 2 { return Err(line_error(line_no, "pop() takes 1-2 arguments")); }
+                let key = args[0].to_script_string();
+                let mut new_map = map.clone();
+                match new_map.remove(&key) {
+                    Some(v) => Ok(v),
+                    None => Ok(if args.len() > 1 { args[1].clone() } else { Value::None }),
+                }
+            }
+            "update" => {
+                if args.len() != 1 { return Err(line_error(line_no, "update() takes 1 argument")); }
+                let mut new_map = map.clone();
+                match &args[0] {
+                    Value::Dict(other) => { for (k, v) in other { new_map.insert(k.clone(), v.clone()); } }
+                    _ => return Err(line_error(line_no, "update() requires a dict")),
+                }
+                Ok(Value::Dict(new_map))
+            }
+            "clear" => {
+                if !args.is_empty() { return Err(line_error(line_no, "clear() takes no arguments")); }
+                Ok(Value::Dict(HashMap::new()))
+            }
+            "copy" => {
+                if !args.is_empty() { return Err(line_error(line_no, "copy() takes no arguments")); }
+                Ok(Value::Dict(map.clone()))
+            }
+            _ => Err(line_error(line_no, &format!("dict has no method '{}'", method))),
+        }
+    }
+
+    fn execute_block_no_runner(&mut self, start: usize, end: usize) -> Result<Flow, RunError> {
+        let mut pc = start;
+        while pc < end {
+            self.steps += 1;
+            if self.steps > 500_000 {
+                return Err(RunError::Line {
+                    line: self.lines[pc].line_no,
+                    source: Box::new(RunError::Parse("too many script steps; possible infinite loop".to_string())),
+                });
+            }
+
+            let line = self.lines[pc].clone();
+            let text = line.text.as_str();
+
+            // break statement
+            if text == "break" {
+                return Ok(Flow::Break);
+            }
+
+            // continue statement
+            if text == "continue" {
+                return Ok(Flow::ContinueLoop);
+            }
+
+            // return statement
+            if let Some(rest) = text.strip_prefix("return") {
+                let rest = rest.trim();
+                let value = if rest.is_empty() {
+                    Value::None
+                } else {
+                    self.eval_expr(rest, line.line_no)?
+                };
+                return Ok(Flow::Return(value));
+            }
+
+            // Skip def blocks
+            if text.starts_with("def ") {
+                let (_, end2) = self.block_bounds(pc)?;
+                pc = end2;
+                continue;
+            }
+
+            // try / except / else / finally
+            if text.starts_with("try:") || text == "try:" {
+                let (flow, chain_end) = self.execute_try_block_no_runner(pc, end)?;
+                match flow {
+                    Flow::Return(v) => return Ok(Flow::Return(v)),
+                    Flow::Break => return Ok(Flow::Break),
+                    Flow::ContinueLoop => return Ok(Flow::ContinueLoop),
+                    _ => {}
+                }
+                pc = chain_end;
+                continue;
+            }
+
+            // if / elif / else
+            if text.starts_with("if ") {
+                let base_indent = line.indent;
+                let condition = text
+                    .strip_prefix("if ")
+                    .and_then(|v| v.strip_suffix(':'))
+                    .ok_or_else(|| line_error(line.line_no, "if statement must end with ':'"))?;
+                let (body_start, body_end) = self.block_bounds(pc)?;
+                if self.eval_expr(condition, line.line_no)?.as_bool() {
+                    let flow = self.execute_block_no_runner(body_start, body_end)?;
+                    match flow {
+                        Flow::Return(_) => return Ok(flow),
+                        _ => {}
+                    }
+                } else {
+                    // Try elif / else chain
+                    let mut next_pc = body_end;
+                    let mut handled = false;
+                    while next_pc < end {
+                        let nl = self.lines[next_pc].clone();
+                        if nl.indent != base_indent { break; }
+                        if let Some(cond) = nl.text.strip_prefix("elif ") {
+                            let cond = cond.strip_suffix(':')
+                                .ok_or_else(|| line_error(nl.line_no, "elif must end with ':'"))?;
+                            let (bs, be) = self.block_bounds(next_pc)?;
+                            if !handled && self.eval_expr(cond, nl.line_no)?.as_bool() {
+                                let flow = self.execute_block_no_runner(bs, be)?;
+                                match flow {
+                                    Flow::Return(_) => return Ok(flow),
+                                    _ => {}
+                                }
+                                handled = true;
+                            }
+                            next_pc = be;
+                        } else if nl.text == "else:" {
+                            let (bs, be) = self.block_bounds(next_pc)?;
+                            if !handled {
+                                let flow = self.execute_block_no_runner(bs, be)?;
+                                match flow {
+                                    Flow::Return(_) => return Ok(flow),
+                                    _ => {}
+                                }
+                            }
+                            next_pc = be;
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                    pc = next_pc;
+                    continue;
+                }
+                // After executing the if-body, skip elif/else
+                let mut next_pc = body_end;
+                let base_indent = line.indent;
+                while next_pc < end {
+                    let nl2 = self.lines[next_pc].clone();
+                    if nl2.indent != base_indent { break; }
+                    if nl2.text.starts_with("elif ") || nl2.text == "else:" {
+                        let (_, be) = self.block_bounds(next_pc)?;
+                        next_pc = be;
+                    } else {
+                        break;
+                    }
+                }
+                pc = next_pc;
+                continue;
+            }
+
+            // for loop
+            if text.starts_with("for ") {
+                let (var, iter) = self.parse_for(text, line.line_no)?;
+                let (body_start, body_end) = self.block_bounds(pc)?;
+                match iter {
+                    ForIter::Range(values) => {
+                        for value in values {
+                            self.set_var(&var, Value::Number(value as f64));
+                            match self.execute_block_no_runner(body_start, body_end)? {
+                                Flow::Continue => {}
+                                Flow::ContinueLoop => continue,
+                                Flow::Break => break,
+                                Flow::Return(v) => return Ok(Flow::Return(v)),
+                                Flow::Goto(_) => {}
+                            }
+                        }
+                    }
+                    ForIter::Values(vals) => {
+                        for value in vals {
+                            self.set_var(&var, value);
+                            match self.execute_block_no_runner(body_start, body_end)? {
+                                Flow::Continue => {}
+                                Flow::ContinueLoop => continue,
+                                Flow::Break => break,
+                                Flow::Return(v) => return Ok(Flow::Return(v)),
+                                Flow::Goto(_) => {}
+                            }
+                        }
+                    }
+                }
+                pc = body_end;
+                continue;
+            }
+
+            // while loop
+            if text.starts_with("while ") {
+                let condition = text
+                    .strip_prefix("while ")
+                    .and_then(|v| v.strip_suffix(':'))
+                    .ok_or_else(|| line_error(line.line_no, "while must end with ':'"))?;
+                let (body_start, body_end) = self.block_bounds(pc)?;
+                let mut loop_count = 0usize;
+                while self.eval_expr(condition, line.line_no)?.as_bool() {
+                    loop_count += 1;
+                    if loop_count > 100_000 {
+                        return Err(line_error(line.line_no, "while loop ran too many times"));
+                    }
+                    match self.execute_block_no_runner(body_start, body_end)? {
+                        Flow::Continue => {}
+                        Flow::ContinueLoop => continue,
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Goto(_) => {}
+                    }
+                }
+                pc = body_end;
+                continue;
+            }
+
+            // pass
+            if text == "pass" || text.trim() == "pass" {
+                pc += 1;
+                continue;
+            }
+
+            // assert
+            if let Some(expr) = text.strip_prefix("assert ") {
+                let expr = expr.trim();
+                let (cond_expr, msg) = if let Some(pos) = find_comma_outside(expr) {
+                    (&expr[..pos], expr[pos + 1..].trim())
+                } else {
+                    (expr, "")
+                };
+                let val = self.eval_expr(cond_expr, line.line_no)?;
+                if !val.as_bool() {
+                    let err_msg = if msg.is_empty() {
+                        "assertion error".to_string()
+                    } else {
+                        self.eval_expr(msg, line.line_no)?.to_script_string()
+                    };
+                    return Err(line_error(line.line_no, &format!("AssertionError: {err_msg}")));
+                }
+                pc += 1;
+                continue;
+            }
+
+            // del
+            if let Some(target) = text.strip_prefix("del ") {
+                let target = target.trim();
+                if target.contains('[') {
+                    self.del_subscript(target, line.line_no)?;
+                } else {
+                    self.del_var(target, line.line_no)?;
+                }
+                pc += 1;
+                continue;
+            }
+
+            // raise
+            if let Some(rest) = text.strip_prefix("raise ") {
+                let rest = rest.trim();
+                let (exc_type, err_msg) = if rest.is_empty() {
+                    ("RuntimeError".to_string(), "raised error".to_string())
+                } else {
+                    let exc_types = ["ValueError", "TypeError", "RuntimeError", "Exception", "KeyError", "IndexError"];
+                    let mut found = None;
+                    for exc in &exc_types {
+                        if let Some(args) = call_args(rest, exc) {
+                            let vals = split_args(args)
+                                .into_iter()
+                                .map(|arg| self.eval_expr(&arg, line.line_no))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            found = Some((exc.to_string(), vals.iter().map(|v| v.to_script_string()).collect::<Vec<_>>().join(" ")));
+                            break;
+                        }
+                    }
+                    match found {
+                        Some((t, m)) => (t, m),
+                        None => ("RuntimeError".to_string(), self.eval_expr(rest, line.line_no)?.to_script_string()),
+                    }
+                };
+                return Err(line_error(line.line_no, &format!("{exc_type}: {err_msg}")));
+            }
+
+            // Augmented assignment
+            if self.try_augmented_assignment(text, line.line_no)?.is_some() {
+                pc += 1;
+                continue;
+            }
+
+            // Tuple unpacking: a, b = expr1, expr2
+            if let Some(eq_pos) = find_eq_outside(text) {
+                let left = text[..eq_pos].trim();
+                let right = text[eq_pos + 1..].trim();
+                if left.contains(',') && !left.contains('[') && !left.contains('(') {
+                    let var_names: Vec<&str> = left.split(',').map(|s| s.trim()).collect();
+                    if var_names.iter().all(|v| !v.is_empty() && v.chars().all(|c| c.is_alphanumeric() || c == '_')) {
+                        let values: Vec<Value> = if right.contains(',') && !right.starts_with('[') && !right.starts_with('(') && !right.starts_with('{') {
+                            split_args(right).into_iter().map(|arg| self.eval_expr(arg.trim(), line.line_no)).collect::<Result<Vec<_>, _>>()?
+                        } else {
+                            let val = self.eval_expr(right, line.line_no)?;
+                            match val {
+                                Value::Tuple(items) => items,
+                                Value::List(items) => items,
+                                _ => return Err(line_error(line.line_no, "cannot unpack non-iterable")),
+                            }
+                        };
+                        if var_names.len() != values.len() {
+                            return Err(line_error(line.line_no, &format!("too many values to unpack (expected {}, got {})", var_names.len(), values.len())));
+                        }
+                        for (name, value) in var_names.into_iter().zip(values) {
+                            self.set_var(name, value);
+                        }
+                        pc += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Assignment
+            if let Some((name, expr)) = split_assignment(text) {
+                let value = self.eval_expr(expr, line.line_no)?;
+                self.set_var(name.trim(), value);
+                pc += 1;
+                continue;
+            }
+
+            // Function call as statement (e.g., print)
+            if let Some(args) = call_args(text, "print") {
+                // print in no-runner context: evaluate but discard output
+                let _values = split_args(args)
+                    .into_iter()
+                    .map(|arg| self.eval_expr(&arg, line.line_no))
+                    .collect::<Result<Vec<_>, _>>()?;
+                pc += 1;
+                continue;
+            }
+
+            // Bare function call as statement
+            if let Some((name, args_str)) = parse_call(text) {
+                if self.functions.contains_key(name) {
+                    let evaluated = split_args(args_str)
+                        .into_iter()
+                        .map(|arg| self.eval_expr(&arg, line.line_no))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.call_function_expr(name, evaluated, line.line_no)?;
+                } else {
+                    // Try evaluating as expression (might be a builtin)
+                    let _ = self.eval_expr(text, line.line_no)?;
+                }
+                pc += 1;
+                continue;
+            }
+
+            // Expression evaluation (fallback)
+            let _ = self.eval_expr(text, line.line_no)?;
+            pc += 1;
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Execute a try/except/else/finally block without runner.
+    /// Scans forward from `start_pc` for except/else/finally at the same indent level.
+    fn execute_try_block_no_runner(&mut self, start_pc: usize, outer_end: usize) -> Result<(Flow, usize), RunError> {
+        let base_indent = self.lines[start_pc].indent;
+        let (try_body_start, try_body_end) = self.block_bounds(start_pc)?;
+
+        // Scan for except/else/finally clauses at base_indent after try body
+        let mut except_clauses: Vec<(usize, usize, Option<String>, Option<String>)> = Vec::new(); // (body_start, body_end, exc_type, alias)
+        let mut else_clause: Option<(usize, usize)> = None;
+        let mut finally_clause: Option<(usize, usize)> = None;
+
+        let mut scan = try_body_end;
+        while scan < outer_end {
+            let sl = &self.lines[scan];
+            if sl.indent != base_indent { break; }
+            if let Some(rest) = sl.text.strip_prefix("except ") {
+                let rest = rest.strip_suffix(':').unwrap_or(rest);
+                let (exc_type, alias) = parse_except_header(rest.trim());
+                let (bs, be) = self.block_bounds(scan)?;
+                except_clauses.push((bs, be, exc_type, alias));
+                scan = be;
+            } else if sl.text == "except:" {
+                let (bs, be) = self.block_bounds(scan)?;
+                except_clauses.push((bs, be, None, None));
+                scan = be;
+            } else if sl.text == "else:" {
+                let (bs, be) = self.block_bounds(scan)?;
+                else_clause = Some((bs, be));
+                scan = be;
+            } else if sl.text == "finally:" {
+                let (bs, be) = self.block_bounds(scan)?;
+                finally_clause = Some((bs, be));
+                scan = be;
+            } else {
+                break;
+            }
+        }
+
+        let chain_end = scan;
+
+        // Execute try body
+        let try_result = self.execute_block_no_runner(try_body_start, try_body_end);
+
+        match try_result {
+            Ok(flow) => {
+                // No exception — run else clause if present
+                let mut final_flow = flow;
+                if let Some((bs, be)) = else_clause {
+                    match final_flow {
+                        Flow::Continue => {
+                            final_flow = self.execute_block_no_runner(bs, be)?;
+                        }
+                        _ => {} // don't run else if try body didn't complete normally
+                    }
+                }
+                // Always run finally
+                if let Some((bs, be)) = finally_clause {
+                    let fflow = self.execute_block_no_runner(bs, be)?;
+                    match fflow {
+                        Flow::Return(v) => final_flow = Flow::Return(v),
+                        Flow::Break => final_flow = Flow::Break,
+                        Flow::ContinueLoop => final_flow = Flow::ContinueLoop,
+                        _ => {}
+                    }
+                }
+                Ok((final_flow, chain_end))
+            }
+            Err(err) => {
+                // Try to match an except clause
+                let err_msg = format!("{err}");
+                let mut matched = false;
+                let mut final_flow = Flow::Continue;
+                for (bs, be, exc_type, alias) in &except_clauses {
+                    let catches = match exc_type {
+                        None => true, // bare except:
+                        Some(t) => err_msg.starts_with(&format!("{}:", t)) || t == "Exception",
+                    };
+                    if catches {
+                        matched = true;
+                        // Set alias variable if specified
+                        if let Some(alias_name) = alias {
+                            // Extract message part after "Type: "
+                            let msg_part = if let Some(colon_pos) = err_msg.find(": ") {
+                                err_msg[colon_pos + 2..].to_string()
+                            } else {
+                                err_msg.clone()
+                            };
+                            self.set_var(alias_name, Value::Text(msg_part));
+                        }
+                        let flow = self.execute_block_no_runner(*bs, *be)?;
+                        final_flow = flow;
+                        break;
+                    }
+                }
+                if !matched {
+                    // No except matched — run finally then re-raise
+                    if let Some((bs, be)) = finally_clause {
+                        let _ = self.execute_block_no_runner(bs, be);
+                    }
+                    return Err(err);
+                }
+                // Run finally
+                if let Some((bs, be)) = finally_clause {
+                    let fflow = self.execute_block_no_runner(bs, be)?;
+                    match fflow {
+                        Flow::Return(v) => final_flow = Flow::Return(v),
+                        Flow::Break => final_flow = Flow::Break,
+                        Flow::ContinueLoop => final_flow = Flow::ContinueLoop,
+                        _ => {}
+                    }
+                }
+                Ok((final_flow, chain_end))
+            }
+        }
     }
 
     fn eval_builtin(
@@ -898,7 +2549,9 @@ impl ScriptInterpreter {
                 let len = match &value {
                     Value::List(items) => items.len(),
                     Value::Text(s) => s.len(),
-                    _ => return Err(line_error(line_no, "len() requires a list or string")),
+                    Value::Dict(map) => map.len(),
+                    Value::Tuple(items) => items.len(),
+                    _ => return Err(line_error(line_no, "len() requires a list, string, dict, or tuple")),
                 };
                 Ok(Some(Value::Number(len as f64)))
             }
@@ -969,6 +2622,225 @@ impl ScriptInterpreter {
                 let value = self.eval_expr(arg, line_no)?.to_float(line_no)?;
                 Ok(Some(Value::Number((value.round() as i64) as f64)))
             }
+            "list" => {
+                if args.is_empty() {
+                    return Ok(Some(Value::List(Vec::new())));
+                }
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                let items = match &value {
+                    Value::List(items) => items.clone(),
+                    Value::Tuple(items) => items.clone(),
+                    Value::Text(s) => s.chars().map(|c| Value::Text(c.to_string())).collect(),
+                    _ => return Err(line_error(line_no, "list() argument must be a list, tuple, or string")),
+                };
+                Ok(Some(Value::List(items)))
+            }
+            "tuple" => {
+                if args.is_empty() {
+                    return Ok(Some(Value::Tuple(Vec::new())));
+                }
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                let items = match &value {
+                    Value::List(items) => items.clone(),
+                    Value::Tuple(items) => items.clone(),
+                    Value::Text(s) => s.chars().map(|c| Value::Text(c.to_string())).collect(),
+                    _ => return Err(line_error(line_no, "tuple() argument must be a list, tuple, or string")),
+                };
+                Ok(Some(Value::Tuple(items)))
+            }
+            "dict" => {
+                if args.is_empty() {
+                    return Ok(Some(Value::Dict(HashMap::new())));
+                }
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                match &value {
+                    Value::List(pairs) | Value::Tuple(pairs) => {
+                        let mut map = HashMap::new();
+                        for pair in pairs {
+                            match pair {
+                                Value::Tuple(kv) if kv.len() == 2 => {
+                                    let key = match &kv[0] {
+                                        Value::Text(s) => s.clone(),
+                                        Value::Number(n) => format!("{}", *n as i64),
+                                        other => other.to_script_string(),
+                                    };
+                                    map.insert(key, kv[1].clone());
+                                }
+                                Value::List(kv) if kv.len() == 2 => {
+                                    let key = match &kv[0] {
+                                        Value::Text(s) => s.clone(),
+                                        Value::Number(n) => format!("{}", *n as i64),
+                                        other => other.to_script_string(),
+                                    };
+                                    map.insert(key, kv[1].clone());
+                                }
+                                _ => return Err(line_error(line_no, "dict() items must be (key, value) pairs")),
+                            }
+                        }
+                        Ok(Some(Value::Dict(map)))
+                    }
+                    _ => Err(line_error(line_no, "dict() argument must be a list of (key, value) pairs")),
+                }
+            }
+            "sum" => {
+                if args.is_empty() {
+                    return Err(line_error(line_no, "sum() requires at least 1 argument"));
+                }
+                let iterable = self.eval_expr(&args[0], line_no)?;
+                let start = if args.len() > 1 {
+                    self.eval_expr(&args[1], line_no)?.to_float(line_no)?
+                } else {
+                    0.0
+                };
+                let items: Vec<Value> = match &iterable {
+                    Value::List(items) => items.clone(),
+                    Value::Tuple(items) => items.clone(),
+                    _ => return Err(line_error(line_no, "sum() first argument must be a list or tuple")),
+                };
+                let mut total = start;
+                for item in items {
+                    total += item.to_float(line_no)?;
+                }
+                Ok(Some(Value::Number(total)))
+            }
+            "sorted" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                let mut items: Vec<Value> = match &value {
+                    Value::List(items) => items.clone(),
+                    Value::Tuple(items) => items.clone(),
+                    Value::Text(s) => {
+                        let mut chars: Vec<char> = s.chars().collect();
+                        chars.sort();
+                        return Ok(Some(Value::List(chars.iter().map(|c| Value::Text(c.to_string())).collect())));
+                    }
+                    _ => return Err(line_error(line_no, "sorted() argument must be a list, tuple, or string")),
+                };
+                items.sort_by(|a, b| match (a, b) {
+                    (Value::Number(x), Value::Number(y)) => {
+                        x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    (Value::Text(x), Value::Text(y)) => x.cmp(y),
+                    _ => std::cmp::Ordering::Equal,
+                });
+                Ok(Some(Value::List(items)))
+            }
+            "reversed" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                let items: Vec<Value> = match &value {
+                    Value::List(items) => items.clone(),
+                    Value::Tuple(items) => items.clone(),
+                    Value::Text(s) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        return Ok(Some(Value::List(
+                            chars.into_iter().rev().map(|c| Value::Text(c.to_string())).collect(),
+                        )));
+                    }
+                    _ => return Err(line_error(line_no, "reversed() argument must be a list, tuple, or string")),
+                };
+                Ok(Some(Value::List(items.into_iter().rev().collect())))
+            }
+            "enumerate" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                let items: Vec<Value> = match &value {
+                    Value::List(items) => items.clone(),
+                    Value::Tuple(items) => items.clone(),
+                    Value::Text(s) => s.chars().map(|c| Value::Text(c.to_string())).collect(),
+                    _ => return Err(line_error(line_no, "enumerate() argument must be a list, tuple, or string")),
+                };
+                let result: Vec<Value> = items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| Value::Tuple(vec![Value::Number(i as f64), v]))
+                    .collect();
+                Ok(Some(Value::List(result)))
+            }
+            "zip" => {
+                if args.len() < 2 {
+                    return Err(line_error(line_no, "zip() requires at least 2 arguments"));
+                }
+                let mut iterables: Vec<Vec<Value>> = Vec::new();
+                for arg in &args {
+                    let value = self.eval_expr(arg, line_no)?;
+                    match &value {
+                        Value::List(items) => iterables.push(items.clone()),
+                        Value::Tuple(items) => iterables.push(items.clone()),
+                        _ => return Err(line_error(line_no, "zip() arguments must be lists or tuples")),
+                    }
+                }
+                let min_len = iterables.iter().map(|v| v.len()).min().unwrap_or(0);
+                let mut result = Vec::new();
+                for i in 0..min_len {
+                    let tuple: Vec<Value> = iterables.iter().map(|v| v[i].clone()).collect();
+                    result.push(Value::Tuple(tuple));
+                }
+                Ok(Some(Value::List(result)))
+            }
+            "chr" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let n = self.eval_expr(arg, line_no)?.to_int(line_no)?;
+                if let Some(c) = char::from_u32(n as u32) {
+                    Ok(Some(Value::Text(c.to_string())))
+                } else {
+                    Err(line_error(line_no, &format!("chr() argument {} out of range", n)))
+                }
+            }
+            "ord" => {
+                let arg = expect_one_arg(name, args.as_slice(), line_no)?;
+                let value = self.eval_expr(arg, line_no)?;
+                match &value {
+                    Value::Text(s) => {
+                        let ch = s.chars().next().ok_or_else(|| {
+                            line_error(line_no, "ord() argument must be a single character")
+                        })?;
+                        Ok(Some(Value::Number(ch as u32 as f64)))
+                    }
+                    _ => Err(line_error(line_no, "ord() argument must be a single character string")),
+                }
+            }
+            "range" => {
+                let (start, stop, step) = if args.len() == 1 {
+                    let n = self.eval_expr(&args[0], line_no)?.to_int(line_no)?;
+                    (0i64, n, 1i64)
+                } else if args.len() == 2 {
+                    let a = self.eval_expr(&args[0], line_no)?.to_int(line_no)?;
+                    let b = self.eval_expr(&args[1], line_no)?.to_int(line_no)?;
+                    (a, b, 1i64)
+                } else if args.len() == 3 {
+                    let a = self.eval_expr(&args[0], line_no)?.to_int(line_no)?;
+                    let b = self.eval_expr(&args[1], line_no)?.to_int(line_no)?;
+                    let s = self.eval_expr(&args[2], line_no)?.to_int(line_no)?;
+                    (a, b, s)
+                } else {
+                    return Err(line_error(line_no, "range() requires 1-3 arguments"));
+                };
+                if step == 0 {
+                    return Err(line_error(line_no, "range() step cannot be 0"));
+                }
+                let mut result = Vec::new();
+                if step > 0 {
+                    let mut i = start;
+                    while i < stop {
+                        result.push(Value::Number(i as f64));
+                        i += step;
+                    }
+                } else {
+                    let mut i = start;
+                    while i > stop {
+                        result.push(Value::Number(i as f64));
+                        i += step;
+                    }
+                }
+                Ok(Some(Value::List(result)))
+            }
+            "input" => {
+                Ok(Some(Value::Text(String::new())))
+            }
             _ => Ok(None),
         }
     }
@@ -1038,7 +2910,7 @@ impl ScriptInterpreter {
             return match value {
                 Value::Number(value) => Ok(Some(*value)),
                 Value::Bool(value) => Ok(Some(if *value { 1.0 } else { 0.0 })),
-                Value::Text(_) | Value::List(_) => Ok(None),
+                _ => Ok(None),
             };
         }
         Ok(None)
@@ -1109,6 +2981,22 @@ fn parse_def_params(text: &str) -> Result<Vec<String>, RunError> {
         .filter(|arg| !arg.trim().is_empty())
         .map(|arg| arg.trim().to_string())
         .collect())
+}
+
+/// Parse an except header like "ValueError", "ValueError as e", or "" (bare except)
+/// Returns (exc_type, alias)
+fn parse_except_header(text: &str) -> (Option<String>, Option<String>) {
+    let text = text.trim();
+    if text.is_empty() {
+        return (None, None);
+    }
+    // Check for "Type as alias"
+    if let Some(as_pos) = text.find(" as ") {
+        let exc_type = text[..as_pos].trim().to_string();
+        let alias = text[as_pos + 4..].trim().to_string();
+        return (Some(exc_type), Some(alias));
+    }
+    (Some(text.to_string()), None)
 }
 
 fn call_args<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -1233,6 +3121,68 @@ fn split_outside<'a>(text: &'a str, needle: &str) -> Option<(&'a str, &'a str)> 
     None
 }
 
+fn find_comma_outside(text: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    for (idx, ch) in text.char_indices() {
+        if ch == '"' || ch == '\'' {
+            quote = if quote == Some(ch) {
+                None
+            } else if quote.is_none() {
+                Some(ch)
+            } else {
+                quote
+            };
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && ch == ',' {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Find the first `=` outside brackets/quotes that is NOT part of ==, !=, >=, <=
+fn find_eq_outside(text: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    let chars: Vec<char> = text.chars().collect();
+    for (idx, ch) in text.char_indices() {
+        if ch == '"' || ch == '\'' {
+            quote = if quote == Some(ch) {
+                None
+            } else if quote.is_none() {
+                Some(ch)
+            } else {
+                quote
+            };
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && ch == '=' {
+            let next = chars.get(idx + 1);
+            let prev = if idx > 0 { chars.get(idx - 1) } else { None };
+            if next == Some(&'=') { continue; }
+            if prev == Some(&'!') || prev == Some(&'>') || prev == Some(&'<') { continue; }
+            return Some(idx);
+        }
+    }
+    None
+}
+
 fn split_format_spec(text: &str) -> (&str, Option<&str>) {
     let mut quote: Option<char> = None;
     let mut depth = 0_i32;
@@ -1280,7 +3230,7 @@ fn format_value(value: &Value, spec: &str, line_no: usize) -> Result<String, Run
             .parse::<f64>()
             .map(|value| format!("{value:.precision$}"))
             .map_err(|_| line_error(line_no, "f-string numeric format requires a number")),
-        Value::List(_) => Err(line_error(line_no, "f-string numeric format requires a number")),
+        _ => Err(line_error(line_no, "f-string numeric format requires a number")),
     }
 }
 
@@ -1309,6 +3259,127 @@ fn split_last_operator<'a>(
         }
     }
     None
+}
+
+fn split_first_operator<'a>(
+    text: &'a str,
+    ops: &[&'static str],
+) -> Option<(&'a str, &'static str, &'a str)> {
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    for (idx, ch) in text.char_indices() {
+        if ch == '"' || ch == '\'' {
+            quote = if quote == Some(ch) { None } else if quote.is_none() { Some(ch) } else { quote };
+        }
+        if quote.is_some() { continue; }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth > 0 { continue; }
+        for op in ops {
+            if text[idx..].starts_with(op) && idx > 0 {
+                return Some((&text[..idx], op, &text[idx + op.len()..]));
+            }
+        }
+    }
+    None
+}
+
+fn find_keyword_outside(text: &str, keyword: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    for (idx, ch) in text.char_indices() {
+        if ch == '"' || ch == '\'' {
+            quote = if quote == Some(ch) { None } else if quote.is_none() { Some(ch) } else { quote };
+        }
+        if quote.is_some() { continue; }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth > 0 { continue; }
+        if text[idx..].starts_with(keyword) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Find the last `.` outside brackets/quotes that is followed by an identifier and `(`.
+/// e.g. `a.b[0].c(x)` returns the dot before `c`.
+fn find_dot_method(text: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    let mut last_dot = None;
+    for (idx, ch) in text.char_indices() {
+        if ch == '"' || ch == '\'' {
+            quote = if quote == Some(ch) { None } else if quote.is_none() { Some(ch) } else { quote };
+        }
+        if quote.is_some() { continue; }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth > 0 { continue; }
+        if ch == '.' {
+            // Check that what follows is an identifier then '('
+            let rest = text[idx + 1..].trim_start();
+            if rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                // find the '(' after the identifier
+                let paren = rest.find('(');
+                if let Some(pi) = paren {
+                    // make sure there's no space or other operator between ident and '('
+                    let maybe_ident = &rest[..pi];
+                    if maybe_ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        // also check the character before '.' is not an operator
+                        if idx > 0 {
+                            let before = text[..idx].chars().next_back().unwrap();
+                            if before.is_ascii_alphanumeric() || before == ')' || before == ']' || before == '_' || before == '"' || before == '\'' {
+                                last_dot = Some(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    last_dot
+}
+
+fn value_contains(container: &Value, item: &Value) -> bool {
+    match container {
+        Value::List(items) => items.iter().any(|v| values_equal(v, item)),
+        Value::Text(s) => match item {
+            Value::Text(t) => s.contains(t.as_str()),
+            _ => false,
+        },
+        Value::Tuple(items) => items.iter().any(|v| values_equal(v, item)),
+        Value::Dict(map) => match item {
+            Value::Text(key) => map.contains_key(key),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => (x - y).abs() <= f64::EPSILON,
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::None, Value::None) => true,
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        (Value::Tuple(x), Value::Tuple(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        _ => false,
+    }
 }
 
 fn looks_like_expr(text: &str) -> bool {
