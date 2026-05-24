@@ -14,7 +14,7 @@ use windows_sys::Win32::{
         Controls::{EM_REPLACESEL, EM_SETSEL, EM_UNDO},
         Input::KeyboardAndMouse::{
             GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT,
-            VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+            VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP, VK_Z,
         },
         WindowsAndMessaging::*,
     },
@@ -605,6 +605,23 @@ unsafe extern "system" fn script_edit_proc(
         let ctrl = GetKeyState(VK_CONTROL as i32) as u16;
         if (ctrl & 0x8000) != 0 {
             do_toggle_comment(hwnd, data.editor);
+            return 0;
+        }
+    }
+
+    // Ctrl+Z : undo, Ctrl+Shift+Z : redo
+    if msg == WM_KEYDOWN && wparam as u32 == VK_Z as u32 {
+        let ctrl = GetKeyState(VK_CONTROL as i32) as u16;
+        if (ctrl & 0x8000) != 0 {
+            let shift = GetKeyState(VK_SHIFT as i32) as u16;
+            if (shift & 0x8000) != 0 {
+                // Ctrl+Shift+Z → Redo
+                SendMessageW(hwnd, 0x0454 /* EM_REDO */, 0, 0);
+            } else {
+                // Ctrl+Z → Undo
+                SendMessageW(hwnd, EM_UNDO, 0, 0);
+            }
+            schedule_editor_highlight(data.editor);
             return 0;
         }
     }
