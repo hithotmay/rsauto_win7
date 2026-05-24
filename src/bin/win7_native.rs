@@ -76,6 +76,7 @@ const IDC_HELP_VIEW: i32 = 141;
 
 const IDC_EDITOR_TABS: i32 = 150;
 const IDC_CLOSE_TAB: i32 = 151;
+const IDC_OPEN_WORKDIR: i32 = 152;
 
 const MB_YESNOCANCEL: u32 = 0x0003;
 const MB_ICONQUESTION: u32 = 0x0020;
@@ -166,6 +167,8 @@ struct AppState {
     confirm: Option<ConfirmState>,
     /// 搜索状态：当前搜索词
     search_query: String,
+    /// 当前工作目录
+    work_dir: PathBuf,
 }
 
 impl Default for AppState {
@@ -185,6 +188,7 @@ impl Default for AppState {
             capture: None,
             confirm: None,
             search_query: String::new(),
+            work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 }
@@ -373,6 +377,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 IDC_OPEN => open_script(),
                 IDC_SAVE => save_script(false),
                 IDC_SAVE_AS => save_script(true),
+                IDC_OPEN_WORKDIR => open_work_dir(),
                 IDC_CAPTURE => begin_capture(CaptureMode::SaveRegion),
                 IDC_CLICK_IMAGE => begin_capture(CaptureMode::ClickImage),
                 IDC_CAPTURE_POINT => begin_capture(CaptureMode::PointClick),
@@ -564,7 +569,7 @@ unsafe fn current_ui_font() -> HWND {
 // ─── 脚本运行 ───────────────────────────────────────────────
 
 unsafe fn start_script() {
-    let (script, tx, stop_requested) = {
+    let (script, work_dir, tx, stop_requested) = {
         let Some(app_lock) = APP.get() else { return; };
         let mut app = app_lock.lock().unwrap();
         if app.running {
@@ -574,13 +579,17 @@ unsafe fn start_script() {
         let editor = app.editor().unwrap();
         editor.clear_error_line();
         let script = editor.text();
+        let work_dir = app.work_dir.clone();
         let (tx, rx) = win7ui::event_channel(to_hwnd(app.hwnd), WM_APP);
         let stop_requested = Arc::new(AtomicBool::new(false));
         app.running = true;
         app.stop_requested = Some(stop_requested.clone());
         app.rx = Some(rx);
-        (script, tx, stop_requested)
+        (script, work_dir, tx, stop_requested)
     };
+
+    // Set process cwd to work_dir so relative paths in scripts work
+    let _ = std::env::set_current_dir(&work_dir);
 
     clear_log();
     update_running_ui(true);
@@ -680,9 +689,16 @@ unsafe fn open_script() {
             let name = path.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "未命名".to_string());
+            // Set work_dir to the file's parent directory
+            if let Some(parent) = path.parent() {
+                let dir = parent.to_path_buf();
+                if let Some(app) = APP.get() {
+                    app.lock().unwrap().work_dir = dir;
+                }
+            }
             add_editor_tab(name, Some(path.clone()), &text);
             append_log(&format!("已打开脚本：{}", path.display()));
-            set_status(&format!("当前脚本：{}", path.display()));
+            update_path_status();
         }
         Err(err) => append_log(&format!("打开失败：{err}")),
     }
@@ -722,6 +738,10 @@ unsafe fn save_script(force_dialog: bool) {
                     tab.display_name = name.clone();
                     tab.content = text;
                 }
+                // Set work_dir to the file's parent directory
+                if let Some(parent) = path.parent() {
+                    app.work_dir = parent.to_path_buf();
+                }
                 app.mark_clean();
                 // Update tab label
                 if let Some(built) = &app.built {
@@ -731,7 +751,7 @@ unsafe fn save_script(force_dialog: bool) {
                 }
             }
             append_log(&format!("已保存脚本：{}", path.display()));
-            set_status(&format!("当前脚本：{}", path.display()));
+            update_path_status();
         }
         Err(err) => append_log(&format!("保存失败：{err}")),
     }
@@ -808,6 +828,7 @@ unsafe fn switch_editor_tab(new_idx: usize) {
         app.mark_clean();
     }
     refresh_editor_view();
+    update_path_status();
 }
 
 /// Close current editor tab (Ctrl+W or close button)
@@ -1757,6 +1778,36 @@ unsafe fn clear_log() {
 
 unsafe fn get_log_view() -> Option<win7ui::LogView> {
     APP.get().and_then(|app| app.lock().unwrap().log_view())
+}
+
+// ─── 工作目录与路径状态显示 ─────────────────────────────────
+
+/// Open work_dir in Windows Explorer
+unsafe fn open_work_dir() {
+    let path = {
+        let Some(app) = APP.get() else { return; };
+        app.lock().unwrap().work_dir.clone()
+    };
+    let dir_str = path.to_string_lossy().to_string();
+    std::process::Command::new("explorer")
+        .arg(&dir_str)
+        .spawn()
+        .ok();
+}
+
+/// Update status bar to show work_dir and current file path
+unsafe fn update_path_status() {
+    let (work_dir_str, file_str) = {
+        let Some(app) = APP.get() else { return; };
+        let app = app.lock().unwrap();
+        let wd = app.work_dir.to_string_lossy().to_string();
+        let cur = app.tabs.get(app.active_tab)
+            .and_then(|t| t.path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "(未保存)".to_string());
+        (wd, cur)
+    };
+    set_status(&format!("目录: {} | 文件: {}", work_dir_str, file_str));
 }
 
 unsafe fn set_status(text: &str) {

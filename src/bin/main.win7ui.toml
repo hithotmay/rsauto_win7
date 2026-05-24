@@ -44,6 +44,12 @@ layout = { size = [0, 42], margin = [6, 6, 0, 6] }
   text = "另存为"
   layout = { size = [80, 30], margin = [0, 4, 6, 0] }
 
+  [[window.children.children]]
+  type = "button"
+  id = 152
+  text = "打开目录"
+  layout = { size = [88, 30], margin = [0, 4, 6, 0] }
+
   # 分隔 Label
   [[window.children.children]]
   type = "label"
