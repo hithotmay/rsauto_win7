@@ -149,6 +149,12 @@ impl RichEdit {
             return;
         }
         let y_height = (-lf.lf_height * 15).max(0) as i32; // pixels → twips: ×1440/96 = ×15
+        // 临时禁用 undo，防止 EM_SETCHARFORMAT 污染 undo 栈
+        const EM_GETUNDOLIMIT: u32 = 0x0400 + 30;
+        const EM_SETUNDOLIMIT: u32 = 0x0400 + 28;
+        let saved_undo_limit = SendMessageW(self.hwnd, EM_GETUNDOLIMIT, 0, 0);
+        SendMessageW(self.hwnd, EM_SETUNDOLIMIT, 0, 0);
+
         let mut cf = CharFormatW {
             cb_size: std::mem::size_of::<CharFormatW>() as u32,
             dw_mask: CFM_FACE | CFM_SIZE,
@@ -188,6 +194,8 @@ impl RichEdit {
         const IMF_AUTOFONT: isize = 0x00000002;
         let opts = SendMessageW(self.hwnd, EM_GETLANGOPTIONS, 0, 0);
         SendMessageW(self.hwnd, EM_SETLANGOPTIONS, 0, (opts & !IMF_AUTOFONT) as LPARAM);
+        // 恢复 undo limit
+        SendMessageW(self.hwnd, EM_SETUNDOLIMIT, saved_undo_limit as usize, 0);
     }
 
     pub unsafe fn create(
@@ -399,6 +407,12 @@ impl RichEdit {
         if self.hwnd.is_null() {
             return;
         }
+        // 临时禁用 undo，防止 EM_SETCHARFORMAT 格式变更污染 undo 栈
+        const EM_GETUNDOLIMIT: u32 = 0x0400 + 30; // WM_USER+30
+        const EM_SETUNDOLIMIT: u32 = 0x0400 + 28; // WM_USER+28
+        let saved_undo_limit = SendMessageW(self.hwnd, EM_GETUNDOLIMIT, 0, 0);
+        SendMessageW(self.hwnd, EM_SETUNDOLIMIT, 0, 0);
+
         let scroll_pos = self.save_scroll_pos();
         let mut original = CharRange {
             cp_min: 0,
@@ -425,6 +439,9 @@ impl RichEdit {
         self.restore_scroll_pos(scroll_pos);
         SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
         self.finish_redraw();
+
+        // 恢复 undo limit
+        SendMessageW(self.hwnd, EM_SETUNDOLIMIT, saved_undo_limit as usize, 0);
     }
 
     pub unsafe fn apply_line_markers(
@@ -438,6 +455,12 @@ impl RichEdit {
         if self.hwnd.is_null() {
             return;
         }
+        // 临时禁用 undo，防止格式变更污染 undo 栈
+        const EM_GETUNDOLIMIT: u32 = 0x0400 + 30;
+        const EM_SETUNDOLIMIT: u32 = 0x0400 + 28;
+        let saved_undo_limit = SendMessageW(self.hwnd, EM_GETUNDOLIMIT, 0, 0);
+        SendMessageW(self.hwnd, EM_SETUNDOLIMIT, 0, 0);
+
         let scroll_pos = self.save_scroll_pos();
         let mut original = CharRange {
             cp_min: 0,
@@ -473,6 +496,9 @@ impl RichEdit {
         self.restore_scroll_pos(scroll_pos);
         SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0);
         self.finish_redraw();
+
+        // 恢复 undo limit
+        SendMessageW(self.hwnd, EM_SETUNDOLIMIT, saved_undo_limit as usize, 0);
     }
 
     /// Search for text starting from `start_pos` (UTF-16 char index), case-insensitive.
