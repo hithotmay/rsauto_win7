@@ -511,51 +511,7 @@ unsafe fn start_script() {
     clear_log();
     update_running_ui(true);
     append_log("开始运行。");
-    thread::spawn(move || {
-        let log_stop = stop_requested.clone();
-        let mut tail_logs: VecDeque<String> = VecDeque::with_capacity(MAX_RUN_LOG_LINES);
-        let mut total_lines = 0usize;
-        let result = Runner::new(stop_requested).and_then(|mut runner| {
-            let mut last_flush = Instant::now();
-            let mut last_vars_flush = Instant::now();
-            let vars_tx = tx.clone();
-
-            runner.run_script(&script, |msg| {
-                if log_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                common::push_tail_log(&mut tail_logs, &mut total_lines, msg);
-
-                if last_flush.elapsed() >= Duration::from_millis(LOG_SNAPSHOT_INTERVAL_MS) {
-                    send_log_snapshot(&tx, &tail_logs, total_lines);
-                    last_flush = Instant::now();
-                }
-            }, |vars| {
-                if last_vars_flush.elapsed() >= Duration::from_millis(500) {
-                    let _ = vars_tx.send(AppEvent::VarsUpdate { vars });
-                    unsafe { vars_tx.wake(); }
-                    last_vars_flush = Instant::now();
-                }
-            })?;
-            Ok(())
-        });
-        let error_line = result.as_ref().err().and_then(|err| match err {
-            RunError::Line { line, .. } => Some(*line),
-            _ => None,
-        });
-        let (final_line, status) = match result {
-            Ok(()) => ("运行完成。".to_string(), "运行完成。"),
-            Err(RunError::Stopped) => ("运行已停止。".to_string(), "运行已停止。"),
-            Err(err) => (format!("错误：{err}"), "运行出错。"),
-        };
-        common::push_tail_log(&mut tail_logs, &mut total_lines, final_line);
-        send_log_snapshot(&tx, &tail_logs, total_lines);
-        let _ = tx.send(AppEvent::Done {
-            status: status.to_string(),
-            error_line,
-        });
-        unsafe { tx.wake(); }
-    });
+    pyauto_rs::ui::app_logic::run_script_thread(script, stop_requested, tx);
 }
 
 unsafe fn stop_script() {
@@ -570,20 +526,7 @@ unsafe fn stop_script() {
     }
 }
 
-fn send_log_snapshot(
-    tx: &win7ui::UiEventSender<AppEvent>,
-    tail_logs: &VecDeque<String>,
-    total_lines: usize,
-) {
-    if tail_logs.is_empty() {
-        return;
-    }
-    let _ = tx.send(AppEvent::ReplaceLog {
-        lines: tail_logs.iter().cloned().collect(),
-        total_lines,
-    });
-    unsafe { tx.wake(); }
-}
+// send_log_snapshot moved to ui::app_logic
 
 
 
@@ -1608,11 +1551,7 @@ unsafe fn drain_events() {
                 }
             }
             AppEvent::VarsUpdate { vars } => {
-                let text: String = vars
-                    .iter()
-                    .map(|(name, value)| format!("{name} = {value}"))
-                    .collect::<Vec<_>>()
-                    .join("\r\n");
+                let text = pyauto_rs::ui::app_logic::format_vars(&vars);
                 if let Some(app) = APP.get() {
                     let app = app.lock().unwrap();
                     if let Some(built) = app.built.as_ref() {

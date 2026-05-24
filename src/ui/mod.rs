@@ -5,6 +5,7 @@
 //! never on platform-specific types like HWND.
 
 pub mod app_common;
+pub mod app_logic;
 pub mod dtt;
 
 use std::path::PathBuf;
