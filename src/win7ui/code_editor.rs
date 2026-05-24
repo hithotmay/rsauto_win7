@@ -166,6 +166,17 @@ impl CodeEditor {
     pub unsafe fn refresh_all(self) {
         let script = self.script_hwnd();
         let text = get_window_text(script);
+        // Save undo snapshot if text changed (skip during undo/redo restore)
+        if let Some(data) = script_data_mut(script) {
+            if !data.in_undo && text != data.last_snapshot {
+                data.redo_stack.clear();
+                data.undo_stack.push(data.last_snapshot.clone());
+                while data.undo_stack.len() > 200 {
+                    data.undo_stack.remove(0);
+                }
+                data.last_snapshot = text.clone();
+            }
+        }
         let spans = highlight_script_spans(&text);
         RichEdit::new(script).apply_highlights(rich_edit_text_units(&text), &spans, color_default());
         self.refresh_marks();
@@ -237,12 +248,16 @@ impl CodeEditor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ScriptSubclassData {
     previous: WNDPROC,
     editor: CodeEditor,
     error_line: Option<usize>,
     mouse_down: bool,
+    undo_stack: Vec<String>,
+    redo_stack: Vec<String>,
+    last_snapshot: String,
+    in_undo: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -256,11 +271,16 @@ unsafe fn subclass_script_editor(hwnd: HWND, editor: CodeEditor) {
         return;
     }
     let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, script_edit_proc as *const () as isize);
+    let init_text = get_window_text(hwnd);
     let data = Box::new(ScriptSubclassData {
         previous: std::mem::transmute(previous),
         editor,
         error_line: None,
         mouse_down: false,
+        undo_stack: Vec::new(),
+        redo_stack: Vec::new(),
+        last_snapshot: init_text,
+        in_undo: false,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
 }
@@ -580,7 +600,7 @@ unsafe extern "system" fn script_edit_proc(
             return CallWindowProcW(data.previous, hwnd, msg, wparam, lparam);
         }
     }
-    let Some(data) = script_data(hwnd) else {
+    let Some(data) = script_data_mut(hwnd) else {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     };
 
@@ -609,15 +629,32 @@ unsafe extern "system" fn script_edit_proc(
         }
     }
 
-    // Ctrl+Shift+Z : redo (Ctrl+Z undo 由 RichEdit 自己处理，不拦截)
+    // Ctrl+Z / Ctrl+Shift+Z : custom undo/redo (bypass RichEdit's polluted undo stack)
     if msg == WM_KEYDOWN && wparam as u32 == VK_Z as u32 {
         let ctrl = GetKeyState(VK_CONTROL as i32) as u16;
         if (ctrl & 0x8000) != 0 {
             let shift = GetKeyState(VK_SHIFT as i32) as u16;
             if (shift & 0x8000) != 0 {
                 // Ctrl+Shift+Z → Redo
-                SendMessageW(hwnd, 0x0454 /* EM_REDO */, 0, 0);
-                schedule_editor_highlight(data.editor);
+                if let Some(prev) = data.redo_stack.pop() {
+                    data.undo_stack.push(data.last_snapshot.clone());
+                    data.last_snapshot = prev.clone();
+                    data.in_undo = true;
+                    RichEdit::new(hwnd).set_text(&prev);
+                    data.editor.refresh_all();
+                    data.in_undo = false;
+                }
+                return 0;
+            } else {
+                // Ctrl+Z → Undo
+                if let Some(prev) = data.undo_stack.pop() {
+                    data.redo_stack.push(data.last_snapshot.clone());
+                    data.last_snapshot = prev.clone();
+                    data.in_undo = true;
+                    RichEdit::new(hwnd).set_text(&prev);
+                    data.editor.refresh_all();
+                    data.in_undo = false;
+                }
                 return 0;
             }
         }
