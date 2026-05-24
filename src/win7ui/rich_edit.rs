@@ -500,7 +500,27 @@ impl RichEdit {
             &mut original as *mut CharRange as LPARAM,
         );
         SendMessageW(self.hwnd, WM_SETREDRAW, 0, 0);
-        self.apply_auto_back_color(0, text_len);
+
+        // For large files, only reset the previously/currently highlighted lines
+        // (not the entire document - that's O(n) and very slow for thousands of lines)
+        let line_count = SendMessageW(self.hwnd, EM_GETLINECOUNT, 0, 0).max(0) as usize;
+        if line_count <= 500 {
+            // Small file: reset entire doc background
+            self.apply_auto_back_color(0, text_len);
+        } else {
+            // Large file: only reset current line and error line backgrounds
+            if let Some(line) = current_line {
+                if let Some((start, end)) = self.line_range(line, text_len) {
+                    self.apply_auto_back_color(start, end);
+                }
+            }
+            if let Some(line) = error_line {
+                if let Some((start, end)) = self.line_range(line, text_len) {
+                    self.apply_auto_back_color(start, end);
+                }
+            }
+        }
+
         if let Some(line) = current_line {
             if Some(line) != error_line {
                 if let Some((start, end)) = self.line_range(line, text_len) {

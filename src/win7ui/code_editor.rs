@@ -280,7 +280,8 @@ impl CodeEditor {
         rich_edit.apply_highlights_region(vis_start, vis_end, total_text_len, &spans, color_default());
     }
 
-    /// Full highlight with get_window_text + undo snapshot (expensive, for deferred timer)
+    /// Full highlight with get_window_text + undo snapshot (for deferred timer)
+    /// Still only applies highlights to visible region for large files
     pub unsafe fn full_highlight(self) {
         let script = self.script_hwnd();
         let text = get_window_text(script);
@@ -295,10 +296,30 @@ impl CodeEditor {
                 data.dirty = text != data.saved_snapshot;
             }
         }
+
         let rich_edit = RichEdit::new(script);
         let text_units = rich_edit_text_units(&text);
-        let spans = highlight_script_spans(&text);
-        rich_edit.apply_highlights(text_units, &spans, color_default());
+        let line_count = rich_edit.line_count();
+
+        if line_count > 500 {
+            // Large file: parse full text but only apply to visible region
+            let full_spans = highlight_script_spans(&text);
+            let first_visible = rich_edit.first_visible_line();
+            let margin = 80;
+            let first_hl_line = first_visible.saturating_sub(margin);
+            let last_hl_line = (first_visible + margin * 2).min(line_count);
+            let vis_start = SendMessageW(script, EM_LINEINDEX, first_hl_line, 0).max(0) as usize;
+            let vis_end_char = SendMessageW(script, EM_LINEINDEX, last_hl_line, 0);
+            let vis_end = if vis_end_char >= 0 { vis_end_char as usize } else { text_units };
+            let vis_spans: Vec<HighlightSpan> = full_spans.into_iter()
+                .filter(|s| s.end > vis_start && s.start < vis_end)
+                .collect();
+            rich_edit.apply_highlights_region(vis_start, vis_end, text_units, &vis_spans, color_default());
+        } else {
+            let spans = highlight_script_spans(&text);
+            rich_edit.apply_highlights(text_units, &spans, color_default());
+        }
+
         if let Some(data) = script_data_mut(script) {
             data.last_highlight_text = text;
         }
@@ -307,8 +328,8 @@ impl CodeEditor {
     pub unsafe fn refresh_marks(self) {
         let script = self.script_hwnd();
         let rich_edit = RichEdit::new(script);
-        let text = get_window_text(script);
-        let text_len = rich_edit_text_units(&text);
+        // Use WM_GETTEXTLENGTH instead of get_window_text to avoid reading entire doc
+        let text_len = SendMessageW(script, WM_GETTEXTLENGTH, 0, 0).max(0) as usize;
         let current_line = Some(rich_edit.current_line());
         let error_line = self.error_line();
         rich_edit.apply_line_markers(
