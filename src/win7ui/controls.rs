@@ -1,7 +1,7 @@
 use std::{ffi::c_void, mem::zeroed, ptr::null_mut};
 
 use windows_sys::Win32::{
-    Foundation::{HINSTANCE, HWND, LPARAM, WPARAM},
+    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::{InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_TAB_CLASSES},
@@ -560,6 +560,253 @@ pub unsafe fn tab_set_item_text(hwnd: HWND, index: i32, text: &str) {
     };
     SendMessageW(hwnd, TCM_SETITEMW, index as usize, &mut item as *mut _ as isize);
 }
+
+// ─── Tab 关闭按钮（自绘 ×）─────────────────────────────────
+
+const TCM_GETITEMRECT: u32 = 0x130A;
+const TCS_OWNERDRAWFIXED: u32 = 0x2000;
+const ODT_TAB: u32 = 101;
+const ODS_SELECTED: u32 = 0x0001;
+const WM_LBUTTONUP: u32 = 0x0202;
+
+/// Close button hit callback: receives the tab index to close.
+pub type TabCloseCallback = unsafe extern "C" fn(i32);
+
+/// Per-TabControl state for close button support.
+struct TabCloseState {
+    original_wndproc: isize,
+    on_close: TabCloseCallback,
+    /// Cached tab count for drawing.
+    hover_tab: i32,
+}
+
+/// Get the bounding rectangle of a tab item. Returns None if index is invalid.
+pub unsafe fn tab_get_item_rect(hwnd: HWND, index: i32) -> Option<RECT> {
+    let mut rect: RECT = std::mem::zeroed();
+    let result = SendMessageW(
+        hwnd,
+        TCM_GETITEMRECT,
+        index as usize,
+        &mut rect as *mut RECT as LPARAM,
+    );
+    if result != 0 {
+        Some(rect)
+    } else {
+        None
+    }
+}
+
+/// Draw a close × glyph centered in the given rect.
+unsafe fn draw_close_button(hdc: isize, rect: &RECT, hovered: bool) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreatePen, DeleteObject, LineTo, MoveToEx, SelectObject,
+    };
+
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
+    let half = 4i32; // × half-size
+
+    let color = if hovered { 0x00CC0000 } else { 0x00808080 }; // blue if hover, gray otherwise
+    let hdc = hdc as *mut std::ffi::c_void;
+    let pen = CreatePen(0, 1, color);
+    let old_pen = SelectObject(hdc, pen);
+    MoveToEx(hdc, cx - half, cy - half, std::ptr::null_mut());
+    LineTo(hdc, cx + half + 1, cy + half + 1);
+    MoveToEx(hdc, cx + half, cy - half, std::ptr::null_mut());
+    LineTo(hdc, cx - half - 1, cy + half + 1);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen);
+}
+
+/// Get the close button rect for a given tab item rect.
+fn close_btn_rect(tab_rect: &RECT) -> RECT {
+    let size = 16i32;
+    let margin_right = 4i32;
+    let vertical_center = (tab_rect.top + tab_rect.bottom) / 2;
+    RECT {
+        left: tab_rect.right - size - margin_right,
+        top: vertical_center - size / 2,
+        right: tab_rect.right - margin_right,
+        bottom: vertical_center + size / 2,
+    }
+}
+
+/// Subclass WNDPROC for closable tabs.
+unsafe extern "system" fn closable_tab_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // Retrieve state via SetWindowLongPtr data
+    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TabCloseState;
+    if state_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let state = &mut *state_ptr;
+
+    match msg {
+        WM_DRAWITEM => {
+            let dis = &*(lparam as *const DRAWITEMSTRUCT);
+            if dis.CtlType != ODT_TAB {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            let hdc = dis.hDC as *mut std::ffi::c_void;
+            let tab_idx = dis.itemID as i32;
+            let rect = dis.rcItem;
+
+            // Background
+            use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect};
+            let bg_color = if dis.itemState & ODS_SELECTED != 0 {
+                0x00FFFFFF // white for selected
+            } else {
+                0x00E8E8E8 // light gray
+            };
+            let brush = CreateSolidBrush(bg_color);
+            FillRect(hdc, &rect, brush);
+            DeleteObject(brush);
+
+            // Get tab text
+            let mut buf = [0u16; 128];
+            let mut item: TCITEMW = std::mem::zeroed();
+            item.mask = TCIF_TEXT;
+            item.psz_text = buf.as_mut_ptr();
+            item.cch_text_max = buf.len() as i32;
+            SendMessageW(
+                hwnd,
+                TCM_GETITEMW,
+                tab_idx as usize,
+                &mut item as *mut _ as LPARAM,
+            );
+
+            // Draw text
+            use windows_sys::Win32::Graphics::Gdi::{SetBkMode, SetTextColor, TextOutW};
+            SetBkMode(hdc, 1); // TRANSPARENT
+            SetTextColor(hdc, 0x001A1A1A); // dark text
+            let text_len = buf.iter().position(|&c| c == 0).unwrap_or(0) as i32;
+            TextOutW(hdc, rect.left + 6, rect.top + 4, buf.as_ptr(), text_len);
+
+            // Draw close button
+            let cb = close_btn_rect(&rect);
+            let hovered = state.hover_tab == tab_idx;
+            draw_close_button(hdc as isize, &cb, hovered);
+
+            return 1; // handled
+        }
+        WM_MOUSEMOVE => {
+            // Track which tab the mouse is over (for hover effect)
+            let pos = (lparam as u32) as i32;
+            let x = pos & 0xFFFF;
+            let y = (pos >> 16) & 0xFFFF;
+            let count = tab_get_count(hwnd);
+            let mut new_hover = -1i32;
+            for i in 0..count {
+                if let Some(r) = tab_get_item_rect(hwnd, i) {
+                    if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
+                        new_hover = i;
+                        break;
+                    }
+                }
+            }
+            if state.hover_tab != new_hover {
+                state.hover_tab = new_hover;
+                use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+                InvalidateRect(hwnd, std::ptr::null(), 1);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_LBUTTONUP => {
+            let pos = (lparam as u32) as i32;
+            let x = pos & 0xFFFF;
+            let y = (pos >> 16) & 0xFFFF;
+            let count = tab_get_count(hwnd);
+            for i in 0..count {
+                if let Some(r) = tab_get_item_rect(hwnd, i) {
+                    let cb = close_btn_rect(&r);
+                    if x >= cb.left && x <= cb.right && y >= cb.top && y <= cb.bottom {
+                        // Close button clicked
+                        (state.on_close)(i);
+                        return 0;
+                    }
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_NCDESTROY => {
+            // Clean up state
+            let _ = Box::from_raw(state_ptr);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return CallWindowProcW(
+                Some(std::mem::transmute::<isize, unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(state.original_wndproc)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            );
+        }
+        _ => {}
+    }
+
+    CallWindowProcW(
+        Some(std::mem::transmute::<isize, unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(state.original_wndproc)),
+        hwnd,
+        msg,
+        wparam,
+        lparam,
+    )
+}
+
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CallWindowProcW, DefWindowProcW, GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA,
+};
+
+/// DRAWITEMSTRUCT for WM_DRAWITEM
+#[repr(C)]
+#[allow(non_snake_case)]
+struct DRAWITEMSTRUCT {
+    CtlType: u32,
+    CtlID: u32,
+    itemID: u32,
+    itemAction: u32,
+    itemState: u32,
+    hwndItem: isize,
+    hDC: isize,
+    rcItem: RECT,
+    itemData: usize,
+}
+
+const TCM_GETITEMW: u32 = 0x133C;
+
+/// Initialize close button support on a TabControl.
+///
+/// # Safety
+/// `hwnd` must be a valid TabControl HWND. `on_close` callback will be
+/// called with the tab index when the close button is clicked.
+pub unsafe fn tab_init_closable(hwnd: HWND, on_close: TabCloseCallback) {
+    // Add OWNERDRAWFIXED style
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, (style | TCS_OWNERDRAWFIXED) as isize);
+
+    // Subclass the control
+    let original = SetWindowLongPtrW(
+        hwnd,
+        GWLP_WNDPROC,
+        closable_tab_wndproc as *const () as isize,
+    );
+
+    let state = Box::new(TabCloseState {
+        original_wndproc: original,
+        on_close,
+        hover_tab: -1,
+    });
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+
+    // Force redraw
+    use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+    InvalidateRect(hwnd, std::ptr::null(), 1);
+}
+
+use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GWLP_WNDPROC, WM_NCDESTROY};
 
 // ─── 扁平化：禁用控件主题 ──────────────────────────────────
 

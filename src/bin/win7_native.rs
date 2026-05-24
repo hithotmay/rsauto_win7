@@ -442,6 +442,16 @@ unsafe fn create_controls(hwnd: HWND) {
         app.built = Some(built);
     }
 
+    // Enable close buttons on editor tab control
+    if let Some(app) = APP.get() {
+        let app = app.lock().unwrap();
+        if let Some(built) = &app.built {
+            if let Some(tab_hwnd) = built.hwnd_by_id(IDC_EDITOR_TABS) {
+                win7ui::controls::tab_init_closable(tab_hwnd, on_editor_tab_close);
+            }
+        }
+    }
+
     update_running_ui(false);
     layout_controls(hwnd);
     refresh_editor_view();
@@ -681,29 +691,34 @@ unsafe fn switch_editor_tab(new_idx: usize) {
     update_path_status();
 }
 
-/// Close current editor tab (Ctrl+W or close button)
-unsafe fn close_current_tab() {
-    let Some(app_lock) = APP.get() else { return; };
+/// Callback for editor tab close button (×).
+unsafe extern "C" fn on_editor_tab_close(tab_index: i32) {
+    close_editor_tab(tab_index as usize);
+}
 
-    // Check dirty
+unsafe fn close_editor_tab(index: usize) {
+    let Some(app_lock) = APP.get() else { return };
+
+    // Check bounds
     {
         let app = app_lock.lock().unwrap();
-        if app.tabs.len() <= 1 {
-            // Only one tab, don't close
+        if app.tabs.len() <= 1 || index >= app.tabs.len() {
             return;
         }
-        if app.is_dirty() {
+    }
+
+    // Check dirty (only prompt if closing the active tab)
+    {
+        let app = app_lock.lock().unwrap();
+        if index == app.active_tab && app.is_dirty() {
             drop(app);
-            // Prompt to save
             let owner = main_hwnd();
             let msg = wide("当前文件已修改，是否保存？");
             let title = wide("关闭标签");
             let result = MessageBoxW(owner, msg.as_ptr(), title.as_ptr(),
                 MB_YESNOCANCEL | MB_ICONQUESTION);
             match result {
-                IDYES => {
-                    save_script(false);
-                }
+                IDYES => { save_script(false); }
                 IDCANCEL => return,
                 _ => {}
             }
@@ -712,10 +727,8 @@ unsafe fn close_current_tab() {
 
     let switch_to = {
         let mut app = app_lock.lock().unwrap();
-        if app.tabs.len() <= 1 {
-            return;
-        }
-        let remove_idx = app.active_tab;
+        if app.tabs.len() <= 1 { return; }
+        let remove_idx = index;
         let switch_to = if remove_idx >= app.tabs.len() - 1 {
             remove_idx - 1
         } else {
@@ -738,8 +751,15 @@ unsafe fn close_current_tab() {
             switch_to
         };
         app.mark_clean();
+        switch_to
     };
     refresh_editor_view();
+}
+
+/// Close current editor tab (Ctrl+W)
+unsafe fn close_current_tab() {
+    let active = APP.get().map(|a| a.lock().unwrap().active_tab).unwrap_or(0);
+    close_editor_tab(active);
 }
 
 /// Check if current tab is dirty and prompt to save.
