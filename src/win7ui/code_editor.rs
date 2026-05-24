@@ -35,8 +35,10 @@ pub const CODE_EDITOR_REFRESH_MARKS: u32 = WM_APP + 22;
 const GUTTER_TIMER_BASE: usize = 20_000;
 const HIGHLIGHT_TIMER_BASE: usize = 30_000;
 const MARK_TIMER_BASE: usize = 40_000;
+const DEFERRED_TIMER_BASE: usize = 50_000;
 const GUTTER_WHEEL_SYNC_MS: u32 = 45;
 const HIGHLIGHT_SYNC_MS: u32 = 200;
+const HIGHLIGHT_DEFERRED_MS: u32 = 1500;
 const MARK_SYNC_MS: u32 = 35;
 const EM_LINESCROLL: u32 = 0x00B6;
 const EM_EXGETSEL: u32 = 0x0400 + 52;
@@ -55,6 +57,7 @@ pub struct CodeEditor {
     gutter_timer: usize,
     highlight_timer: usize,
     mark_timer: usize,
+    deferred_timer: usize,
 }
 
 impl CodeEditor {
@@ -93,6 +96,7 @@ impl CodeEditor {
             gutter_timer: GUTTER_TIMER_BASE + id.max(0) as usize,
             highlight_timer: HIGHLIGHT_TIMER_BASE + id.max(0) as usize,
             mark_timer: MARK_TIMER_BASE + id.max(0) as usize,
+            deferred_timer: DEFERRED_TIMER_BASE + id.max(0) as usize,
         };
         subclass_script_editor(script, editor);
         subclass_line_number_gutter(gutter, editor);
@@ -176,8 +180,24 @@ impl CodeEditor {
 
     pub unsafe fn refresh_all(self) {
         let script = self.script_hwnd();
+        let rich_edit = RichEdit::new(script);
+        let line_count = rich_edit.line_count();
+
+        if line_count > 500 {
+            // FAST PATH for large files: do NOT call get_window_text()
+            // Just set dirty flag and highlight visible lines via EM_GETLINE
+            if let Some(data) = script_data_mut(script) {
+                if !data.in_undo {
+                    data.dirty = true;
+                }
+            }
+            self.highlight_visible_only(&rich_edit, line_count);
+            self.refresh_marks();
+            return;
+        }
+
+        // SMALL FILE path: full get_window_text + undo snapshot + full highlight
         let text = get_window_text(script);
-        // Save undo snapshot if text changed (skip during undo/redo restore)
         if let Some(data) = script_data_mut(script) {
             if !data.in_undo && text != data.last_snapshot {
                 data.redo_stack.clear();
@@ -186,12 +206,10 @@ impl CodeEditor {
                     data.undo_stack.remove(0);
                 }
                 data.last_snapshot = text.clone();
-                // Update dirty state
                 data.dirty = text != data.saved_snapshot;
             }
         }
 
-        // Skip re-highlight if text hasn't changed since last highlight
         let needs_highlight = script_data(script)
             .map(|d| d.last_highlight_text != text)
             .unwrap_or(true);
@@ -200,39 +218,90 @@ impl CodeEditor {
             return;
         }
 
-        let rich_edit = RichEdit::new(script);
         let text_units = rich_edit_text_units(&text);
+        let spans = highlight_script_spans(&text);
+        rich_edit.apply_highlights(text_units, &spans, color_default());
 
-        // For large files (>500 lines), only apply highlights to visible region
-        let line_count = rich_edit.line_count();
-        let first_visible = rich_edit.first_visible_line();
-        let visible_margin = 80;
-
-        if line_count > 500 {
-            // Parse full text for spans, but only apply colors to visible region
-            let full_spans = highlight_script_spans(&text);
-            let first_hl_line = first_visible.saturating_sub(visible_margin);
-            let last_hl_line = (first_visible + visible_margin * 2).min(line_count);
-            let vis_start = SendMessageW(script, EM_LINEINDEX, first_hl_line, 0).max(0) as usize;
-            let vis_end_char = SendMessageW(script, EM_LINEINDEX, last_hl_line, 0);
-            let vis_end = if vis_end_char >= 0 { vis_end_char as usize } else { text_units };
-
-            // Filter spans to visible region
-            let vis_spans: Vec<HighlightSpan> = full_spans.into_iter()
-                .filter(|s| s.end > vis_start && s.start < vis_end)
-                .collect();
-            rich_edit.apply_highlights_region(vis_start, vis_end, text_units, &vis_spans, color_default());
-        } else {
-            // Small file: full highlight
-            let spans = highlight_script_spans(&text);
-            rich_edit.apply_highlights(text_units, &spans, color_default());
-        }
-
-        // Store highlighted text
         if let Some(data) = script_data_mut(script) {
             data.last_highlight_text = text;
         }
         self.refresh_marks();
+    }
+
+    /// Fast visible-line-only highlight using EM_GETLINE (no get_window_text).
+    /// Reads only ~160 lines around the viewport.
+    unsafe fn highlight_visible_only(self, rich_edit: &RichEdit, line_count: usize) {
+        let script = self.script_hwnd();
+        let first_visible = rich_edit.first_visible_line();
+        let margin = 80;
+        let first_line = first_visible.saturating_sub(margin);
+        let last_line = (first_visible + margin * 2).min(line_count);
+
+        // Read visible lines one by one via EM_GETLINE, build combined text
+        let mut combined = String::new();
+        let mut line_starts: Vec<usize> = Vec::new(); // UTF-16 unit offset of each line relative to vis_start
+        let vis_start = SendMessageW(script, EM_LINEINDEX, first_line, 0).max(0) as usize;
+        let vis_end_char = SendMessageW(script, EM_LINEINDEX, last_line, 0);
+        let total_text_len = SendMessageW(script, WM_GETTEXTLENGTH, 0, 0).max(0) as usize;
+        let vis_end = if vis_end_char >= 0 { vis_end_char as usize } else { total_text_len };
+
+        // Read each line via EM_GETLINE (fast, only reads one line)
+        for line_idx in first_line..last_line {
+            let line_start = SendMessageW(script, EM_LINEINDEX, line_idx, 0).max(0) as usize;
+            let next_start = SendMessageW(script, EM_LINEINDEX, line_idx + 1, 0);
+            let line_end = if next_start >= 0 { next_start as usize } else { total_text_len };
+            let line_len = line_end.saturating_sub(line_start);
+
+            line_starts.push(rich_edit_text_units(&combined));
+
+            if line_len > 0 {
+                let mut buf = vec![0u16; line_len + 1];
+                buf[0] = (line_len.min(65535)) as u16;
+                let copied = SendMessageW(
+                    script, 0x00C4 /* EM_GETLINE */,
+                    line_idx as usize, buf.as_mut_ptr() as LPARAM,
+                );
+                if copied > 0 {
+                    let s = String::from_utf16_lossy(&buf[..copied as usize]);
+                    combined.push_str(&s);
+                }
+            }
+            combined.push('\n');
+        }
+
+        // Highlight the combined visible text
+        let mut spans = highlight_script_spans(&combined);
+        // Offset spans by vis_start
+        for span in &mut spans {
+            span.start = span.start.saturating_add(vis_start);
+            span.end = span.end.saturating_add(vis_start);
+        }
+
+        rich_edit.apply_highlights_region(vis_start, vis_end, total_text_len, &spans, color_default());
+    }
+
+    /// Full highlight with get_window_text + undo snapshot (expensive, for deferred timer)
+    pub unsafe fn full_highlight(self) {
+        let script = self.script_hwnd();
+        let text = get_window_text(script);
+        if let Some(data) = script_data_mut(script) {
+            if !data.in_undo && text != data.last_snapshot {
+                data.redo_stack.clear();
+                data.undo_stack.push(data.last_snapshot.clone());
+                while data.undo_stack.len() > 200 {
+                    data.undo_stack.remove(0);
+                }
+                data.last_snapshot = text.clone();
+                data.dirty = text != data.saved_snapshot;
+            }
+        }
+        let rich_edit = RichEdit::new(script);
+        let text_units = rich_edit_text_units(&text);
+        let spans = highlight_script_spans(&text);
+        rich_edit.apply_highlights(text_units, &spans, color_default());
+        if let Some(data) = script_data_mut(script) {
+            data.last_highlight_text = text;
+        }
     }
 
     pub unsafe fn refresh_marks(self) {
@@ -274,6 +343,11 @@ impl CodeEditor {
         } else if timer_id == self.mark_timer {
             KillTimer(to_hwnd(self.parent), self.mark_timer);
             self.refresh_marks();
+            true
+        } else if timer_id == self.deferred_timer {
+            KillTimer(to_hwnd(self.parent), self.deferred_timer);
+            // Deferred: do full highlight + undo snapshot update
+            self.full_highlight();
             true
         } else {
             false
@@ -922,6 +996,14 @@ unsafe fn schedule_editor_highlight(editor: CodeEditor) {
     let parent = to_hwnd(editor.parent);
     PostMessageW(parent, CODE_EDITOR_REFRESH_GUTTER, 0, 0);
     SetTimer(parent, editor.highlight_timer, HIGHLIGHT_SYNC_MS, None);
+    // For large files, schedule a deferred full highlight + undo snapshot
+    let script = editor.script_hwnd();
+    if !script.is_null() {
+        let line_count = SendMessageW(script, EM_GETLINECOUNT, 0, 0).max(0) as usize;
+        if line_count > 500 {
+            SetTimer(parent, editor.deferred_timer, HIGHLIGHT_DEFERRED_MS, None);
+        }
+    }
 }
 
 unsafe fn schedule_editor_mark_refresh(editor: CodeEditor) {
